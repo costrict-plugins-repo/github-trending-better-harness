@@ -1,0 +1,124 @@
+{
+  "name": "@qoder-ai/better-harness-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Electron desktop shell for Harness Studio",
+  "license": "MIT",
+  "type": "module",
+  "main": "src/main.mjs",
+  "engines": {
+    "node": ">=22.20.0 <25.0.0"
+  },
+  "scripts": {
+    "build": "npm run build -w @qoder-ai/harness && npm run build -w @qoder-ai/harness-studio && npm run build:rust && npm run build:go -- --desktop",
+    "start": "electron .",
+    "test": "node --test test/*.test.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "smoke:acp": "node scripts/acp-smoke.mjs",
+    "stage": "node scripts/stage.mjs",
+    "pack": "npm run build && npm run stage && electron-builder --dir",
+    "dist": "npm run build && npm run stage && electron-builder",
+    "build:rust": "node scripts/rust.mjs",
+    "build:chart": "node scripts/chart-runtime.mjs",
+    "smoke:chart": "node scripts/chart-runtime.mjs --smoke",
+    "smoke:chart-bridge": "node scripts/native-chart-smoke.mjs",
+    "smoke:chart-packaged": "node scripts/native-chart-smoke.mjs --packaged",
+    "test:chart": "node scripts/chart-runtime.mjs --test",
+    "test:chart-packaging": "node --test test/chart-runtime-packaging.test.mjs",
+    "icons": "node scripts/icons.mjs",
+    "test:rust": "node scripts/rust.mjs --test",
+    "test:native": "npm exec -w @qoder-ai/harness-studio -- vitest run --config vitest.native.config.ts",
+    "build:go": "node scripts/go.mjs",
+    "test:go": "node scripts/go.mjs --test"
+  },
+  "dependencies": {
+    "@qoder-ai/harness-studio": "0.1.1",
+    "@qoder-ai/harness-studio-apps": "0.1.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "electron": "44.4.2",
+    "electron-builder": "26.15.3"
+  },
+  "build": {
+    "appId": "com.qoder.harness-studio",
+    "productName": "Harness Studio",
+    "directories": {
+      "app": "dist/app",
+      "output": "dist/installers"
+    },
+    "files": [
+      "src/**",
+      "package.json",
+      "node_modules/**"
+    ],
+    "asarUnpack": [
+      "**/*.node",
+      "**/*.wasm",
+      "**/esbuild-wasm/**",
+      "**/@qoder-ai/harness-studio/dist/agent-react/runtime/**",
+      "**/@qoder-ai/harness-studio/dist/agent-react/contracts/**",
+      "**/node_modules/react/**",
+      "**/node_modules/react-dom/**",
+      "**/node_modules/scheduler/**",
+      "**/harness-studio-apps/**"
+    ],
+    "npmRebuild": false,
+    "mac": {
+      "target": [
+        "zip"
+      ],
+      "icon": "build/icon.icns",
+      "category": "public.app-category.developer-tools"
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "build/icon.ico",
+      "extraResources": [
+        {
+          "from": "dist/native",
+          "to": "native",
+          "filter": [
+            "harness-oxc-service*",
+            "harness-acp-host*",
+            "harness-evidence-host*",
+            "harness-diff-host*",
+            "harness-diff-service.NOTICES.txt",
+            "harness-arch-host*",
+            "harness-pty-host*",
+            "harness-chart-runtime.node",
+            "harness-chart-runtime.NOTICES.txt"
+          ]
+        }
+      ]
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "icon": "build/icon.png",
+      "category": "Development",
+      "executableName": "harness-studio",
+      "extraResources": [
+        {
+          "from": "dist/native",
+          "to": "native",
+          "filter": [
+            "harness-oxc-service*",
+            "harness-acp-host*",
+            "harness-evidence-host*",
+            "harness-diff-host*",
+            "harness-diff-service.NOTICES.txt",
+            "harness-arch-host*",
+            "harness-pty-host*",
+            "harness-chart-runtime.node",
+            "harness-chart-runtime.NOTICES.txt"
+          ]
+        }
+      ]
+    },
+    "afterPack": "scripts/after-pack.mjs"
+  }
+}

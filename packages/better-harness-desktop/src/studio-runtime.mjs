@@ -1,0 +1,198 @@
+import { createGoEsbuildLinker, GO_ESBUILD_LINKER_VERSION } from "@qoder-ai/harness-studio/esbuild-service";
+import { createRustOxcCompiler } from "@qoder-ai/harness-studio/oxc-service";
+import { join } from 'node:path';
+import { parentPort } from 'node:worker_threads';
+import { message, isMessage } from './protocol.mjs';
+import {
+  startHarnessStudioServer, defaultAppDir, discoverAcpAgentProfiles,
+  createRustEvidenceHost, createRustEvidenceWorkspaceSessionProvider,
+  createRustDiffHost,
+  createRustArchHost,
+  createRustPtyHost,
+  createBundledAgentCustomizationCollector,
+} from '@qoder-ai/harness-studio';
+
+const port = parentPort;
+if (!port) throw new Error('Studio service requires an Electron utility parent');
+let server;
+let starting = false;
+let stopping = false;
+let pendingPicker;
+let pickerId = 0;
+const compilers = new Set();
+
+function pickDirectory() {
+  if (pendingPicker) return Promise.reject(new Error('Directory chooser already open'));
+  return new Promise((resolve, reject) => {
+    const id = ++pickerId;
+    const timer = setTimeout(() => {
+      pendingPicker = undefined;
+      reject(new Error('Directory chooser timed out'));
+    }, 10 * 60 * 1000);
+    pendingPicker = { id, resolve, reject, timer };
+    port.postMessage(message('pick-directory', { id }));
+  });
+}
+
+async function stop() {
+  if (stopping) return;
+  stopping = true;
+  if (pendingPicker) {
+    clearTimeout(pendingPicker.timer);
+    pendingPicker.reject(new Error('Studio is shutting down'));
+    pendingPicker = undefined;
+  }
+  await Promise.all([...compilers].map((compiler) => compiler.close()));
+  await server?.close();
+  process.exit(0);
+}
+
+port.on('message', async (data) => {
+  try {
+    if (isMessage(data, 'start') && !starting && !stopping) {
+      // `boxExecExecutable` is optional: builds without BoxLite omit it, and
+      // Studio then offers no microVM placement. A wrong type is still a fault.
+      if (typeof data.token !== 'string' || data.token.length !== 64 || typeof data.dataDirectory !== 'string' || (data.esbuildExecutable !== undefined && (typeof data.esbuildExecutable !== 'string' || data.esbuildTransport !== 'nsxpc' || process.platform !== 'darwin')) || (data.boxExecExecutable !== undefined && typeof data.boxExecExecutable !== 'string') || typeof data.oxcExecutable !== 'string' || typeof data.acpHostExecutable !== 'string' || typeof data.evidenceHostExecutable !== 'string' || typeof data.diffHostExecutable !== 'string' || typeof data.archHostExecutable !== 'string' || (data.appsHostUrl !== undefined && typeof data.appsHostUrl !== 'string') || !['stdio', 'nsxpc'].includes(data.oxcTransport) || !['stdio', 'nsxpc'].includes(data.acpHostTransport) || !['stdio', 'nsxpc'].includes(data.evidenceHostTransport) || !['stdio', 'nsxpc'].includes(data.diffHostTransport) || !['stdio', 'nsxpc'].includes(data.archHostTransport)) {
+        throw new Error('Invalid Studio startup contract');
+      }
+      starting = true;
+      const oxcCompilerFactory = ({ timeoutMs }) => {
+        if (stopping) throw new Error('Studio is shutting down');
+        const compiler = createRustOxcCompiler({ executable: data.oxcExecutable, transport: data.oxcTransport, timeoutMs });
+        const close = compiler.close.bind(compiler);
+        compiler.close = async () => { try { await close(); } finally { compilers.delete(compiler); } };
+        compilers.add(compiler);
+        return compiler;
+      };
+      const artifactLinkerFactory = data.esbuildExecutable === undefined ? undefined : ({ timeoutMs }) => {
+        if (stopping) throw new Error('Studio is shutting down');
+        const linker = createGoEsbuildLinker({ executable: data.esbuildExecutable, transport: data.esbuildTransport, timeoutMs });
+        const close = linker.close.bind(linker);
+        linker.close = async () => { try { await close(); } finally { compilers.delete(linker); } };
+        compilers.add(linker);
+        return linker;
+      };
+      let esbuildPid;
+      let esbuildBridgePid;
+      if (artifactLinkerFactory) {
+        const linkProbe = artifactLinkerFactory({ timeoutMs: 5_000 });
+        try {
+          const packages = ['react', '@studio/agent-react', '@studio/agent-react/jsx-dev-runtime'];
+          const linked = await linkProbe.link({
+            compiledModules: new Map([['/desktop-smoke.js', 'export default {id:"desktop-smoke"};']]),
+            entryModule: '/desktop-smoke.js', maxOutputBytes: 1024 * 1024,
+            resolver: { allowedPackages: packages, resolveRuntimePackage: (name) => packages.includes(name) ? name : undefined },
+          });
+          if (linked.status !== 'ready') throw new Error('Go esbuild startup probe failed');
+          esbuildPid = linkProbe.processId;
+          esbuildBridgePid = linkProbe.bridgeProcessId;
+        } finally { await linkProbe.close(); }
+      }
+      const probe = oxcCompilerFactory({ timeoutMs: 5_000 });
+      let oxcPid;
+      let bridgePid;
+      try {
+        const compiled = await probe.compileModule({ module: { path: '/desktop-smoke.tsx', text: 'export const Desktop = () => <h1>你好</h1>;' }, entry: false, allowedPackages: ['@studio/agent-react/jsx-dev-runtime'] });
+        if (compiled.diagnostics.length || !compiled.code) throw new Error('Rust OXC startup probe failed');
+        oxcPid = probe.processId;
+        bridgePid = probe.bridgeProcessId;
+      } finally { await probe.close(); }
+      const nativeLibraries = process.report.getReport().sharedObjects;
+      if (nativeLibraries.some((library) => /oxc[_-](parser|transform)/i.test(library))) throw new Error('OXC NAPI unexpectedly loaded in Studio');
+      const acpAgents = await discoverAcpAgentProfiles();
+      const evidenceHost = createRustEvidenceHost({
+        executable: data.evidenceHostExecutable,
+        transport: data.evidenceHostTransport,
+      });
+      compilers.add({ close: () => evidenceHost.close() });
+      await evidenceHost.describe();
+      // The commit view's structural reading. Describing it up front proves the
+      // service hop once, so a broken host is a startup error rather than a
+      // surprise the first time a reader opens a commit.
+      const diffHost = createRustDiffHost({
+        executable: data.diffHostExecutable,
+        transport: data.diffHostTransport,
+      });
+      compilers.add({ close: () => diffHost.close() });
+      await diffHost.describe();
+      // The commit view's architecture reading. Described up front for the same
+      // reason as the diff host: a broken host is a startup error rather than a
+      // surprise the first time a reader opens the Architecture pane.
+      const archHost = createRustArchHost({
+        executable: data.archHostExecutable,
+        transport: data.archHostTransport,
+      });
+      compilers.add({ close: () => archHost.close() });
+      await archHost.describe();
+      // The terminal driver. Unlike the four above, nothing consumes it yet, so
+      // a broken host must not abort startup: describe it best-effort to prove
+      // the service hop when the bundle is present, and carry on when it is not
+      // (Windows has no ConPTY backend, so it is simply absent there).
+      let ptyPid;
+      let ptyBridgePid;
+      let ptyRuntime = 'unavailable';
+      let ptyProvider;
+      if (typeof data.ptyHostExecutable === 'string') {
+        const ptyHost = createRustPtyHost({
+          executable: data.ptyHostExecutable,
+          transport: data.ptyHostTransport,
+        });
+        compilers.add({ close: () => ptyHost.close() });
+        try {
+          await ptyHost.describe();
+          ptyPid = ptyHost.processId;
+          ptyBridgePid = ptyHost.bridgeProcessId;
+          ptyRuntime = data.ptyHostTransport === 'nsxpc' ? 'pty-v1-nsxpc' : 'pty-v1-rust';
+          // Only a host that proved its transport is handed to the server; a
+          // broken bundle stays unadvertised rather than surfacing a terminal
+          // control that cannot spawn.
+          ptyProvider = ptyHost;
+        } catch (error) {
+          console.warn(`[better-harness-desktop] pty host unavailable: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      // Local diagnostic receipt, without source text or credentials. Emitted
+      // once every host has proven itself, so the receipt covers all of them.
+      console.info(JSON.stringify({ kind: 'better-harness-desktop.oxc-proof', rust: true, transport: data.oxcTransport, bridgePid, oxcPid, studioPid: process.pid, oxcNativeLoaded: false, esbuildPid, esbuildBridgePid, esbuildTransport: artifactLinkerFactory ? data.esbuildTransport : 'wasm', esbuildVersion: artifactLinkerFactory ? GO_ESBUILD_LINKER_VERSION : undefined, acpTransport: data.acpHostTransport, acpRuntime: data.acpHostTransport === 'nsxpc' ? 'acp-v1-nsxpc' : 'acp-v1-rust', evidenceTransport: data.evidenceHostTransport, evidenceRuntime: data.evidenceHostTransport === 'nsxpc' ? 'evidence-v1-nsxpc' : 'evidence-v1-rust', diffTransport: data.diffHostTransport, diffRuntime: data.diffHostTransport === 'nsxpc' ? 'diff-v1-nsxpc' : 'diff-v1-rust', archPid: archHost.processId, archBridgePid: archHost.bridgeProcessId, archTransport: data.archHostTransport, archRuntime: data.archHostTransport === 'nsxpc' ? 'arch-v1-nsxpc' : 'arch-v1-rust', ptyTransport: data.ptyHostTransport, ptyRuntime, ptyPid, ptyBridgePid }));
+      server = await startHarnessStudioServer({
+        oxcCompilerFactory,
+        artifactLinkerFactory,
+        acpHostExecutable: data.acpHostExecutable,
+        acpHostTransport: data.acpHostTransport,
+        structuralDiffProvider: diffHost,
+        architectureImpactProvider: archHost,
+        ...(ptyProvider ? { ptyProvider } : {}),
+        ...(data.boxExecExecutable === undefined ? {} : { boxExecExecutable: data.boxExecExecutable }),
+        ...(typeof data.appsHostUrl === 'string' ? { appsHostUrl: data.appsHostUrl } : {}),
+        acpAgents,
+        harnessMode: 'workspace-default',
+        appDir: defaultAppDir(), host: '127.0.0.1', port: 0, accessToken: data.token,
+        cwd: data.dataDirectory,
+        runDirectory: join(data.dataDirectory, 'runs'),
+        artifactProviderStateRoot: join(data.dataDirectory, 'providers'),
+        walnutCacheRoot: join(data.dataDirectory, 'cache'),
+        // Remembered Projects: a relaunch resumes the reader's Project instead
+        // of opening on the empty gate.
+        projectStateRoot: join(data.dataDirectory, 'state'),
+        workspaceSessionProvider: createRustEvidenceWorkspaceSessionProvider(evidenceHost),
+        memoryProvider: evidenceHost,
+        sessionPerformanceProvider: evidenceHost,
+        customizationCollector: createBundledAgentCustomizationCollector(),
+        workspaceDirectoryPicker: pickDirectory,
+      });
+      port.postMessage(message('ready', {
+        url: server.url, pid: process.pid, node: process.versions.node, oxc: true,
+      }));
+    } else if (isMessage(data, 'directory-result') && pendingPicker?.id === data.id) {
+      const pending = pendingPicker;
+      pendingPicker = undefined;
+      clearTimeout(pending.timer);
+      if (typeof data.error === 'string') pending.reject(new Error(data.error));
+      else if (data.path === undefined || typeof data.path === 'string') pending.resolve(data.path);
+      else pending.reject(new Error('Invalid directory result'));
+    } else if (isMessage(data, 'stop')) await stop();
+  } catch (error) {
+    port.postMessage(message('error', { error: error instanceof Error ? error.message : String(error) }));
+    await stop();
+  }
+});

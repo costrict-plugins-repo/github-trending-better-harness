@@ -1,0 +1,964 @@
+#root { min-height: 100vh; min-height: 100dvh; }
+
+.studio-loading {
+  min-height: 100vh;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: var(--space-sm);
+  color: var(--color-text-muted);
+}
+
+/* The same tile the empty workspace draws: the brand mark carries its own
+   gradient, so a filled primary tile would swallow the green end of it. */
+.studio-loading-mark {
+  width: var(--pane-header-height);
+  height: var(--pane-header-height);
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-xs);
+  background: var(--color-primary-soft);
+}
+
+.studio-loading p { margin: 0; }
+.studio-loading > button { margin-top: var(--space-sm); }
+
+.studio-welcome {
+  min-width: 0;
+  height: 100%;
+  overflow: auto;
+  display: grid;
+  place-items: center;
+  padding: var(--space-xl);
+}
+.studio-welcome-content { width: min(100%, 64ch); min-width: 0; }
+.studio-welcome-content > svg { color: var(--color-primary); }
+.studio-welcome h2 { font-size: var(--type-display-size); line-height: var(--type-display-line); letter-spacing: var(--type-display-track); margin: var(--space-lg) 0 var(--space-sm); }
+.studio-welcome p { color: var(--color-text-muted); }
+.studio-welcome .workspace-folder-controls { margin: var(--space-xl) 0; padding: 0; justify-items: start; }
+.studio-welcome dl { margin: var(--space-xxl) 0 0; }
+.studio-welcome dl > div { border-top: 1px solid var(--color-border); padding: var(--space-md) 0; }
+.studio-welcome dt { font-weight: var(--weight-semibold); }
+.studio-welcome dd { margin: var(--space-xs) 0 0; color: var(--color-text-muted); }
+
+/* The window: a source-list sidebar beside one content column. `canvas` shows
+   only where a region has not claimed space, so it reads as window frame. */
+.studio-control-plane {
+  width: 100%;
+  height: 100vh;
+  height: 100dvh;
+  position: relative;
+  display: grid;
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+  overflow: hidden;
+  color: var(--color-text);
+  background: var(--color-canvas);
+}
+
+/* The sash rides the sidebar's trailing edge. Its hit area is wider than the
+   hairline it controls, because a 1px drag target is not reachable, and it draws
+   the accent only on hover, focus, or drag so a resting window stays quiet. */
+.studio-sidebar-sash {
+  width: 9px;
+  position: absolute;
+  z-index: 35;
+  top: var(--titlebar-height);
+  bottom: 0;
+  left: var(--sidebar-width);
+  transform: translateX(-4px);
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.studio-sidebar-sash::after {
+  content: "";
+  width: var(--sash-size);
+  position: absolute;
+  inset-block: 0;
+  left: 4px;
+  background: transparent;
+  transition: background var(--motion-fast) ease;
+}
+
+.studio-sidebar-sash:hover::after,
+.studio-sidebar-sash.dragging::after { width: 2px; background: var(--color-primary); }
+.studio-sidebar-sash:focus-visible { outline: 2px solid var(--color-focus); outline-offset: -1px; border-radius: var(--radius-xs); }
+
+/* The divider between two docked panes inside a workbench. It occupies a real
+   grid track, so the panes it separates never overlap it, and it stays quiet
+   until hover, focus, or a drag names it as the thing being moved. */
+.studio-pane-sash {
+  min-width: 0;
+  min-height: 0;
+  touch-action: none;
+  background: var(--color-border);
+  transition: background var(--motion-fast) ease;
+}
+
+.studio-pane-sash[data-orientation="vertical"] { cursor: col-resize; }
+.studio-pane-sash[data-orientation="horizontal"] { cursor: row-resize; }
+.studio-pane-sash:hover,
+.studio-pane-sash.dragging { background: var(--color-primary); }
+.studio-pane-sash:focus-visible { outline: 2px solid var(--color-focus); outline-offset: -2px; }
+
+/* Collapsing only applies where the sidebar is docked. Below the breakpoint it is
+   already an overlay driven by `navigation-open`, and hiding it here would make
+   that overlay unreachable. */
+@media (min-width: 1081px) {
+  .studio-control-plane[data-sidebar="collapsed"] { grid-template-columns: minmax(0, 1fr); }
+  .studio-control-plane[data-sidebar="collapsed"] > .studio-primary-nav { display: none; }
+  .studio-control-plane[data-sidebar="collapsed"] .studio-sidebar-sash { display: none; }
+  /* With the sidebar gone the toolbar owns the toggle, so the action stays
+     reversible instead of collapsing into a dead end. */
+  .studio-control-plane[data-sidebar="collapsed"] .studio-nav-toggle { display: grid; }
+}
+
+.studio-primary-nav {
+  min-width: 0;
+  height: 100%;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--color-border);
+  color: var(--color-text);
+  background: var(--color-sidebar);
+}
+
+/* The brand block is the sidebar's slice of the unified title bar: same height
+   and same material as the toolbar beside it, so the top of the window reads as
+   one continuous band rather than two stacked headers. */
+.studio-product-brand {
+  height: var(--titlebar-height);
+  flex: none;
+  padding: 0 var(--space-md);
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-titlebar);
+}
+
+/* The leading glyph is the sidebar's own hide control. It used to be a
+   decorative mark, which left a wide window with no way to collapse the sidebar
+   at all. */
+.studio-sidebar-collapse {
+  width: var(--toolbar-target);
+  height: var(--toolbar-target);
+  flex: none;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-xs);
+  color: var(--color-text-muted);
+  background: transparent;
+}
+
+.studio-sidebar-collapse:hover { color: var(--color-text); background: var(--color-surface-hover); }
+
+.studio-product-brand > div { min-width: 0; display: flex; align-items: baseline; gap: var(--space-xs); }
+.studio-product-brand strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--type-label-size); line-height: var(--type-label-line); }
+.studio-product-brand small { flex: none; color: var(--color-text-subtle); }
+.studio-project-close { display: none; width: var(--toolbar-target); height: var(--toolbar-target); margin-left: auto; place-items: center; padding: 0; }
+
+.studio-primary-nav > nav {
+  min-height: 0;
+  flex: 1;
+  overflow-y: auto;
+  padding-bottom: var(--space-sm);
+}
+
+/* The Project switcher: the sidebar's scope, stated once on one line. It is a
+   menu button rather than a list, so a second Project can no longer render
+   between the scope and the Views that belong to it. */
+.studio-project-switcher {
+  flex: none;
+  position: relative;
+  padding: var(--space-sm) var(--sidebar-inset) var(--space-xs);
+  background: var(--color-sidebar);
+}
+
+/* The observation window sits with the Project, above the View list: together
+   they scope every View, which is why neither is one of the rows. */
+.studio-date-range {
+  flex: none;
+  padding: 0 var(--sidebar-inset) var(--space-sm);
+  display: grid;
+  gap: var(--space-xs);
+  background: var(--color-sidebar);
+}
+
+.studio-date-range-preset {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: center;
+  color: var(--color-text-muted);
+}
+
+.studio-date-range-preset > svg {
+  grid-area: 1 / 1;
+  margin-inline: var(--space-sm);
+  pointer-events: none;
+  z-index: 1;
+}
+.studio-date-range-preset > svg:last-child { justify-self: end; }
+
+.studio-date-range-preset select {
+  grid-area: 1 / 1;
+  appearance: none;
+  width: 100%;
+  min-width: 0;
+  height: var(--control-height);
+  padding: 0 var(--space-xxl);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-xs);
+  color: var(--color-text);
+  background: var(--color-surface);
+  font: inherit;
+}
+
+.studio-date-range-custom {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 0;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-xs);
+  background: var(--color-surface);
+  overflow: hidden;
+}
+
+.studio-date-range-custom label {
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  padding-inline: var(--space-sm);
+  color: var(--color-text-muted);
+  font-size: var(--type-meta-size);
+}
+
+.studio-date-range-custom input {
+  width: 100%;
+  min-width: 0;
+  height: var(--control-height);
+  padding: 0 var(--space-xs);
+  border: 0;
+  border-radius: 0;
+  color: var(--color-text);
+  background: var(--color-surface);
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+}
+
+.studio-date-range-custom > :nth-child(-n + 2) { border-bottom: 1px solid var(--color-border); }
+.studio-date-range-preset select:hover,
+.studio-date-range-custom input:hover { background: var(--color-surface-hover); }
+/* Join the focus edge to these neutral fields instead of adding a second frame. */
+.studio-date-range-preset select:focus-visible,
+.studio-date-range-custom input:focus-visible { outline: 2px solid var(--color-focus); outline-offset: -2px; }
+.studio-date-range-custom input:focus-visible { border-radius: 0; }
+
+.studio-date-range-summary {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: var(--type-meta-size);
+  font-variant-numeric: tabular-nums;
+}
+
+.studio-date-range-summary.status-warning { color: var(--color-warning); }
+
+/* A shortfall the reader can act on, not an error: it reads as a note under the
+   control that causes it, in the same muted voice as the resolved span. */
+.studio-date-range-omitted {
+  margin: var(--space-xs) 0 0;
+  color: var(--color-text-muted);
+  font-size: var(--type-meta-size);
+  line-height: var(--type-meta-line);
+}
+
+.studio-project-switcher > button {
+  width: 100%;
+  min-width: 0;
+  min-height: var(--control-height);
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: var(--space-sm);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-xs);
+  padding: 0 var(--space-sm);
+  color: var(--color-text);
+  background: var(--color-surface);
+  text-align: left;
+}
+
+.studio-project-switcher > button:hover:not(:disabled) { background: var(--color-surface-hover); }
+.studio-project-switcher > button[aria-expanded="true"] { border-color: var(--color-border-strong); background: var(--color-surface-active); }
+.studio-project-switcher > button > svg { justify-self: center; color: var(--color-text-muted); }
+.studio-project-switcher > button strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--type-label-size); font-weight: var(--weight-medium); }
+.studio-project-switcher > button small { flex: none; color: var(--color-danger); font-size: var(--type-meta-size); white-space: nowrap; }
+
+/* A pop-up, so it takes the floating elevation the contract reserves for menus. */
+.studio-project-menu {
+  position: absolute;
+  z-index: 40;
+  top: calc(100% - var(--space-xs));
+  left: var(--sidebar-inset);
+  right: var(--sidebar-inset);
+  max-height: 60vh;
+  overflow-y: auto;
+  padding: var(--space-xs);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-popover);
+}
+
+.studio-project-menu-row { min-width: 0; position: relative; display: grid; grid-template-columns: minmax(0, 1fr); align-items: center; }
+
+.studio-project-menu-row > button:first-child {
+  width: 100%;
+  min-width: 0;
+  min-height: var(--control-height);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 2px;
+  border: 0;
+  border-radius: var(--radius-xs);
+  padding: var(--space-xs) var(--space-sm);
+  color: var(--color-text);
+  background: transparent;
+  text-align: left;
+}
+
+.studio-project-menu-row > button:first-child:hover { background: var(--color-surface-hover); }
+.studio-project-menu-row > button:first-child[aria-checked="true"] { color: var(--color-on-primary); background: var(--color-primary); }
+.studio-project-menu-row > button:first-child[aria-checked="true"]:hover { background: var(--color-primary-hover); }
+.studio-project-menu-row strong { min-width: 0; overflow: hidden; color: inherit; text-overflow: ellipsis; white-space: nowrap; font-size: var(--type-label-size); font-weight: var(--weight-regular); }
+.studio-project-menu-row > button:first-child[aria-checked="true"] strong { font-weight: var(--weight-semibold); }
+.studio-project-menu-row small { min-width: 0; overflow: hidden; color: var(--color-text-subtle); text-overflow: ellipsis; white-space: nowrap; font-size: var(--type-meta-size); }
+.studio-project-menu-row > button:first-child[aria-checked="true"] small { color: currentColor; }
+
+.studio-project-open {
+  width: 100%;
+  min-height: var(--control-height);
+  margin-top: var(--space-xs);
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  border: 0;
+  border-top: 1px solid var(--color-border);
+  border-radius: 0;
+  padding: var(--space-xs) var(--space-sm);
+  color: var(--color-text-muted);
+  background: transparent;
+  text-align: left;
+  font-size: var(--type-label-size);
+}
+
+.studio-project-open:hover:not(:disabled) { color: var(--color-text); background: var(--color-surface-hover); }
+.studio-project-open:disabled { color: var(--color-text-subtle); }
+.studio-project-spinner { width: var(--space-md); height: var(--space-md); border: 2px solid var(--color-border-strong); border-top-color: var(--color-primary); border-radius: var(--radius-full); animation: workspace-progress-spin 720ms linear infinite; }
+
+/* Source-list rows are inset and rounded, and the active row is filled with the
+   accent, as in a focused macOS source list. The former 2px leading border plus
+   tinted label is a VS Code treatment and asked `primary` to read as text on an
+   accent-tinted bed, which cannot reach AA in either theme. */
+.studio-project-views button {
+  width: calc(100% - var(--sidebar-inset) * 2);
+  min-width: 0;
+  min-height: var(--navigation-row-height);
+  margin-inline: var(--sidebar-inset);
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-sm);
+  border: 0;
+  border-radius: var(--radius-sm);
+  padding: 0 var(--space-sm);
+  color: var(--color-text);
+  background: transparent;
+  text-align: left;
+  font-weight: var(--weight-regular);
+}
+
+.studio-project-views button:hover { background: var(--color-surface-hover); }
+.studio-project-views button:active { background: var(--color-surface-active); }
+
+.studio-project-views button[aria-current="page"] {
+  color: var(--color-on-primary);
+  background: var(--color-primary);
+}
+
+.studio-project-views button[aria-current="page"]:hover { background: var(--color-primary-hover); }
+
+.studio-project-views button > svg { justify-self: center; color: var(--color-text-muted); }
+.studio-project-views button[aria-current="page"] > svg { color: currentColor; }
+
+.studio-project-views button strong { min-width: 0; overflow: hidden; color: inherit; text-overflow: ellipsis; white-space: nowrap; font-size: var(--type-label-size); font-weight: var(--weight-regular); }
+.studio-project-views button[aria-current="page"] strong { font-weight: var(--weight-semibold); }
+
+/* The trailing slot: a named availability for a View. */
+.studio-project-views button small { flex: none; color: var(--color-text-subtle); font-size: var(--type-meta-size); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.studio-project-views button[aria-current="page"] small { color: currentColor; }
+
+.studio-project-remove { width: var(--toolbar-target); height: var(--toolbar-target); position: absolute; top: 50%; right: var(--space-xs); display: grid; place-items: center; border: 0; border-radius: var(--radius-xs); padding: 0; color: var(--color-text-subtle); background: transparent; opacity: 0; transform: translateY(-50%); }
+.studio-project-menu-row:hover .studio-project-remove,
+.studio-project-remove:focus-visible { opacity: 1; }
+.studio-project-remove:hover { color: var(--color-danger); background: var(--color-danger-surface); }
+.studio-project-menu-row:hover .studio-project-remove ~ button small,
+.studio-project-menu-row:focus-within .studio-project-remove ~ button small { visibility: hidden; }
+.studio-project-empty { margin: 0; padding: var(--space-md); display: flex; align-items: center; gap: var(--space-sm); color: var(--color-text-muted); }
+
+.studio-project-views { padding-top: var(--space-xs); }
+/* Section grouping: consecutive View rows that share a role sit under one muted
+   header (Daily, Professional), the macOS source-list convention for grouping
+   rows without adding a second control level. */
+.studio-nav-section { display: grid; min-width: 0; }
+.studio-nav-section-title { margin: 0; padding: var(--space-sm) var(--space-md) var(--space-xs); color: var(--color-text-muted); font-size: var(--type-meta-size); font-weight: var(--weight-semibold); }
+.studio-nav-section + .studio-nav-section .studio-nav-section-title { padding-top: var(--space-md); }
+
+/* A View that navigates by sub-route keeps those rows as the source list's second
+   level: one disclosure row, then its indented children. The indent is the only
+   depth cue, so a child stays a plain source-list row. Sessions splits its row:
+   the label navigates and the caret at the row's trailing edge discloses. */
+.studio-nav-group, .studio-nav-group-children { display: grid; min-width: 0; }
+.studio-nav-group-children { padding-left: var(--space-lg); }
+.studio-nav-group-row {
+  width: calc(100% - var(--sidebar-inset) * 2);
+  min-width: 0;
+  margin-inline: var(--sidebar-inset);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) var(--toolbar-target);
+  align-items: center;
+}
+.studio-nav-group-row > button { width: 100%; margin-inline: 0; }
+.studio-nav-group-label { grid-column: 1; }
+/* The caret discloses the group and sits at the row's trailing edge, the same
+   slot a plain source-list row uses for its trailing status. */
+.studio-project-views .studio-nav-group-toggle {
+  grid-column: 2;
+  width: var(--toolbar-target);
+  min-height: var(--navigation-row-height);
+  display: grid;
+  grid-template-columns: 1fr;
+  place-items: center;
+  padding: 0;
+}
+
+.availability-dot {
+  width: var(--space-sm);
+  height: var(--space-sm);
+  display: inline-block;
+  flex: none;
+  border: 1px solid currentColor;
+  border-radius: var(--radius-full);
+  color: var(--color-text-subtle);
+  background: transparent;
+}
+
+/* Scoped to the dot: these paint a filled indicator, so an unscoped class would
+   also fill the trailing availability *label* that reuses the same name. */
+.availability-dot.availability-ready { color: var(--color-success); background: var(--color-success); }
+.availability-dot.availability-partial { color: var(--color-warning); background: var(--color-warning); }
+.availability-dot.availability-foundation { color: var(--color-text-subtle); background: transparent; }
+
+/* The content column: unified toolbar, one work area, status bar. Fixed rows so
+   the work area scrolls locally and the shell itself never scrolls. */
+.studio-area {
+  min-width: 0;
+  height: 100%;
+  display: grid;
+  grid-template-rows: var(--titlebar-height) minmax(0, 1fr) var(--statusbar-height);
+  overflow: hidden;
+  background: var(--color-workspace);
+}
+
+.studio-context-bar {
+  position: relative;
+  min-width: 0;
+  z-index: 20;
+  padding: 0 var(--space-sm) 0 var(--space-md);
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-titlebar);
+}
+
+.studio-nav-toggle {
+  display: none;
+  width: var(--toolbar-target);
+  height: var(--toolbar-target);
+  place-items: center;
+  padding: 0;
+}
+
+.studio-context-title { min-width: 0; flex: 1; display: flex; align-items: baseline; gap: var(--space-sm); }
+.studio-context-subtitle { color: var(--color-text-muted); font-size: var(--type-meta-size); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.studio-context-title h1 {
+  overflow: hidden;
+  margin: 0;
+  color: var(--color-text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--type-subhead-size);
+  font-weight: var(--weight-semibold);
+  line-height: var(--type-subhead-line);
+}
+
+.studio-context-navigation { min-width: 0; flex: 1; display: block; }
+
+/* The View's action slot. It takes no space while empty, so a View that has no
+   primary action leaves the toolbar exactly as it was. */
+.studio-context-actions { flex: none; margin-left: auto; display: flex; align-items: center; gap: var(--space-sm); }
+.studio-context-actions:empty { display: none; }
+.studio-context-actions button { min-height: var(--toolbar-target); flex: none; display: inline-flex; align-items: center; gap: var(--space-xs); }
+
+/* The shell's own toolbar actions, to the right of the View's. The View slot
+   disappears when empty, taking its auto margin with it, so this group claims
+   the margin in that case and stays on the trailing edge either way. */
+.studio-shell-actions { flex: none; display: flex; align-items: center; gap: var(--space-sm); }
+.studio-context-actions:empty + .studio-shell-actions { margin-left: auto; }
+.studio-scan-action {
+  width: var(--toolbar-target);
+  height: var(--toolbar-target);
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  padding: 0;
+  color: var(--color-text-muted);
+  background: transparent;
+}
+.studio-scan-action:hover:not(:disabled) { color: var(--color-text); background: var(--color-surface-hover); }
+.studio-scan-action:disabled { color: var(--color-text-subtle); }
+.studio-theme-toggle {
+  min-height: var(--control-height);
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-xs);
+  padding-inline: var(--space-sm);
+  color: var(--color-text-muted);
+  background: transparent;
+}
+.studio-theme-toggle:hover { color: var(--color-text); background: var(--color-surface-hover); }
+.studio-theme-toggle svg { color: var(--color-primary); }
+.studio-language-toggle {
+  min-height: var(--control-height);
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-xs);
+  padding-inline: var(--space-sm);
+  color: var(--color-text-muted);
+  background: transparent;
+  font-size: var(--type-meta-size);
+  font-weight: var(--weight-semibold);
+  letter-spacing: 0.04em;
+}
+.studio-language-toggle:hover { color: var(--color-text); background: var(--color-surface-hover); }
+.studio-language-toggle span { color: var(--color-primary); }
+.studio-source-switcher { position: relative; flex: none; }
+.studio-source-switcher > button {
+  min-height: var(--control-height);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-xs);
+  padding: 0 var(--space-sm);
+  color: var(--color-text);
+}
+.studio-source-switcher > button em {
+  min-width: var(--space-md);
+  min-height: var(--space-md);
+  display: inline-grid;
+  place-items: center;
+  border-radius: var(--radius-full);
+  color: var(--color-on-primary);
+  background: var(--color-primary);
+  font-style: normal;
+  font-size: var(--type-meta-size);
+}
+.studio-source-menu {
+  position: absolute;
+  top: calc(100% + var(--space-xs));
+  right: 0;
+  z-index: 50;
+  width: min(360px, calc(100vw - var(--space-lg)));
+  max-height: min(70vh, 420px);
+  overflow: auto;
+  display: grid;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+}
+.studio-source-menu section + section { border-top: 1px solid var(--color-border); }
+.studio-source-menu h2 {
+  margin: 0;
+  padding: var(--space-xs) var(--space-sm);
+  color: var(--color-text-muted);
+  font-size: var(--type-meta-size);
+  line-height: var(--type-meta-line);
+}
+.studio-source-menu button {
+  width: 100%;
+  min-height: var(--row-height);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--space-sm);
+  align-items: center;
+  border: 0;
+  border-radius: var(--radius-none);
+  padding: var(--space-xs) var(--space-sm);
+  background: transparent;
+  color: var(--color-text);
+  text-align: left;
+}
+.studio-source-menu button:hover,
+.studio-source-menu button.selected { background: var(--color-surface-selected); }
+.studio-source-menu strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--type-meta-size); }
+.studio-source-menu span { color: var(--color-text-muted); font-size: var(--type-meta-size); }
+/* The status bar reports scope and counts, and gives the shell a bottom
+   boundary so a short view no longer trails off into bare canvas. */
+.studio-status-bar {
+  min-width: 0;
+  padding: 0 var(--space-md);
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  border-top: 1px solid var(--color-border);
+  background: var(--color-statusbar);
+  color: var(--color-text-muted);
+  font-size: var(--type-meta-size);
+  line-height: var(--type-meta-line);
+}
+
+/* The sidebar's closing row. Settings is library-wide, so it sits at the bottom
+   of the source list rather than competing with the current View's action in the
+   toolbar, and its pop-up opens upward because the trigger is on a bottom edge. */
+.studio-sidebar-footer {
+  flex: none;
+  padding: var(--space-xs) var(--sidebar-inset);
+  border-top: 1px solid var(--color-border);
+  background: var(--color-sidebar);
+}
+
+.studio-settings { position: relative; }
+
+.studio-settings-toggle {
+  width: 100%;
+  min-height: var(--navigation-row-height);
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  border: 0;
+  border-radius: var(--radius-sm);
+  padding: 0 var(--space-sm);
+  color: var(--color-text-muted);
+  background: transparent;
+  text-align: left;
+  font-size: var(--type-label-size);
+}
+
+.studio-settings-toggle > svg { flex: none; }
+.studio-settings-toggle:hover { color: var(--color-text); background: var(--color-surface-hover); }
+.studio-settings-toggle[aria-expanded="true"] { color: var(--color-text); background: var(--color-surface-active); }
+
+.studio-settings-menu {
+  position: absolute;
+  z-index: 70;
+  bottom: calc(100% + var(--space-xs));
+  left: 0;
+  right: 0;
+  padding: var(--space-sm);
+  display: grid;
+  gap: var(--space-xs);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-popover);
+}
+
+.studio-settings-menu h2 {
+  margin: 0;
+  padding: var(--space-xs) var(--space-xs) 0;
+  color: var(--color-text-subtle);
+  font-size: var(--type-pane-size);
+  font-weight: var(--weight-semibold);
+  line-height: var(--type-pane-line);
+  letter-spacing: var(--type-pane-track);
+}
+
+/* Inside the pop-up the two toggles are full-width rows, not toolbar chips. */
+.studio-settings-menu > button {
+  width: 100%;
+  min-height: var(--control-height);
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  border: 0;
+  border-radius: var(--radius-xs);
+  padding: 0 var(--space-sm);
+  color: var(--color-text);
+  background: transparent;
+  text-align: left;
+  font-size: var(--type-label-size);
+}
+
+.studio-settings-menu > button:hover { background: var(--color-surface-hover); }
+.studio-settings-menu > button > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.studio-status-scope { min-width: 0; display: flex; align-items: center; gap: var(--space-sm); }
+.studio-status-scope strong { min-width: 0; overflow: hidden; color: var(--color-text); text-overflow: ellipsis; white-space: nowrap; font-size: var(--type-meta-size); font-weight: var(--weight-medium); }
+.studio-status-scope > span[role="status"] { flex: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.studio-status-counts { flex: none; margin-left: auto; display: flex; align-items: center; gap: var(--space-md); font-variant-numeric: tabular-nums; }
+.studio-status-counts span { white-space: nowrap; }
+
+.studio-project-failure { position: absolute; top: calc(var(--titlebar-height) + var(--space-xs)); right: var(--space-sm); z-index: 60; max-width: min(460px, calc(100vw - var(--space-lg))); border: 1px solid var(--color-danger); border-radius: var(--radius-sm); padding: var(--space-sm) var(--space-md); color: var(--color-danger); background: var(--color-danger-surface); box-shadow: var(--shadow-popover); font-size: var(--type-meta-size); }
+
+/* Frameless desktop shell.
+
+   With no native title bar, Studio's own top band is the window's drag handle,
+   and it has to leave room for the OS window controls painted into it. Every
+   control inside the band opts back out of dragging, or it stops being
+   clickable. These rules are inert in a browser tab, which has a real title bar
+   and never sets `data-shell`. */
+[data-shell="desktop"] .studio-product-brand,
+[data-shell="desktop"] .studio-context-bar { -webkit-app-region: drag; app-region: drag; }
+
+[data-shell="desktop"] .studio-product-brand button,
+[data-shell="desktop"] .studio-context-bar button,
+[data-shell="desktop"] .studio-context-bar a,
+[data-shell="desktop"] .studio-context-bar input,
+[data-shell="desktop"] .studio-context-bar label,
+[data-shell="desktop"] .studio-context-bar select,
+[data-shell="desktop"] .studio-context-bar [role="tablist"],
+[data-shell="desktop"] .studio-source-menu,
+[data-shell="desktop"] .studio-project-failure { -webkit-app-region: no-drag; app-region: no-drag; }
+
+/* macOS traffic lights are inlaid at the leading edge, which is the sidebar's
+   slice of the band. The wordmark gives up that space: a frameless native app
+   carries its identity in the menu bar and Dock, not in a sidebar caption, and
+   keeping it here only truncated it. The mark stays as an anchor. */
+[data-shell="desktop"][data-window-controls="left"] .studio-product-brand { padding-left: 78px; }
+/* Clipped rather than removed, so the product name stays in the accessibility
+   tree and the region keeps an accessible label. */
+[data-shell="desktop"][data-window-controls="left"] .studio-product-brand > div {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+/* Windows and Linux overlay their controls on the trailing edge instead. */
+[data-shell="desktop"][data-window-controls="right"] .studio-context-bar { padding-right: 146px; }
+
+/* Collapsing the sidebar removes the region the traffic lights were inlaid into,
+   so the reserved space moves to the toolbar. Without this the lights would sit
+   over application content. */
+[data-shell="desktop"][data-window-controls="left"] .studio-control-plane[data-sidebar="collapsed"] .studio-context-bar { padding-left: 78px; }
+
+.studio-surface { min-width: 0; min-height: 0; overflow: auto; background: var(--color-workspace); }
+.studio-surface-inspector,
+.studio-surface-artifacts,
+.studio-surface-customizations,
+.studio-surface-debugger,
+.studio-surface-sessions,
+.studio-surface-session-performance,
+.studio-surface-impact,
+.studio-surface-compare { overflow: hidden; }
+.studio-surface .debugger-mode,
+.studio-surface main.experiment-mode { width: 100%; height: 100%; min-height: 0; max-width: none; margin: 0; padding: 0; }
+.studio-surface .builder-shell,
+.studio-surface .experiment-shell { min-height: 100%; height: 100%; }
+.studio-nav-backdrop { display: none; }
+
+.studio-tabs {
+  min-height: var(--control-height);
+  display: grid;
+  border: 0;
+  background: transparent;
+}
+
+.studio-tabs button {
+  min-height: var(--control-height);
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: var(--radius-none);
+  padding: var(--space-xs) var(--space-md);
+  color: var(--color-text-muted);
+  background: transparent;
+  font-weight: var(--weight-regular);
+}
+
+.studio-tabs button:hover { background: var(--color-surface-hover); }
+.studio-tabs button[aria-selected="true"],
+.studio-tabs button.active { border-bottom-color: var(--color-primary); color: var(--color-primary); background: var(--color-surface); font-weight: var(--weight-semibold); }
+.studio-secondary-tabs { min-width: 276px; }
+
+.empty-workspace > small,
+.evidence-results > header small,
+.decision-summary header small {
+  color: var(--color-primary);
+  font-size: var(--type-meta-size);
+  font-weight: var(--weight-semibold);
+  line-height: var(--type-meta-line);
+}
+
+.evidence-table-pane > header {
+  min-height: var(--pane-header-height);
+  padding: 0 var(--space-md);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-md);
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-surface-subtle);
+}
+
+.evidence-table-pane h2 { margin: 0; font-size: var(--type-label-size); line-height: var(--type-label-line); }
+.evidence-table-pane > header > span { color: var(--color-text-muted); font-size: var(--type-meta-size); }
+
+.inspector-workspace { width: 100%; height: 100%; display: grid; grid-template-rows: var(--pane-header-height) minmax(0, 1fr); overflow: hidden; }
+.inspector-workspace > header { min-width: 0; padding: 0 var(--space-sm); display: flex; align-items: center; justify-content: space-between; gap: var(--space-md); border-bottom: 1px solid var(--color-border); background: var(--color-surface-subtle); }
+.inspector-workspace > header > div { min-width: 0; display: flex; align-items: baseline; gap: var(--space-sm); }
+.inspector-workspace > header strong { font-size: var(--type-pane-size); }
+.inspector-workspace > header span,
+.inspector-workspace > header p { margin: 0; color: var(--color-text-muted); font-size: var(--type-meta-size); }
+.inspector-workspace iframe { width: 100%; height: 100%; border: 0; background: var(--color-workspace); }
+.inspector-native-shell,
+.inspector-native-host,
+.inspector-fallback-shell { width: 100%; height: 100%; min-height: 0; overflow: hidden; }
+.inspector-native-shell { position: relative; background: var(--color-workspace); }
+.inspector-native-host { display: block; }
+.inspector-native-status,
+.inspector-fallback-message { margin: 0; padding: var(--space-sm) var(--space-md); border-bottom: 1px solid var(--color-border); color: var(--color-text-muted); background: var(--color-surface-subtle); font-size: var(--type-meta-size); }
+.inspector-native-status { position: absolute; inset: 0 0 auto; z-index: 2; }
+.inspector-fallback-shell { display: grid; grid-template-rows: auto minmax(0, 1fr); }
+
+.empty-workspace { width: 100%; min-height: 100%; margin: 0; padding: var(--space-xl); display: grid; place-content: center; justify-items: center; text-align: center; }
+.empty-workspace > span { width: var(--space-xxxl); height: var(--space-xxxl); margin-bottom: var(--space-md); display: grid; place-items: center; border: 1px solid var(--color-border-strong); border-radius: var(--radius-xs); color: var(--color-primary); background: var(--color-primary-soft); }
+.empty-workspace h1 { margin: var(--space-xs) 0; }
+.empty-workspace p { max-width: 64ch; margin: 0; color: var(--color-text-muted); }
+.empty-workspace > button { margin-top: var(--space-lg); }
+.empty-workspace code { margin-top: var(--space-lg); border: 1px solid var(--color-border); border-radius: var(--radius-xs); padding: var(--space-xs) var(--space-sm); color: var(--color-primary); background: var(--color-surface); }
+
+.evidence-results { width: 100%; height: 100%; margin: 0; padding: 0; overflow: auto; }
+.evidence-results > header { min-height: var(--pane-header-height); padding: 0 var(--space-md); display: flex; align-items: center; justify-content: space-between; gap: var(--space-md); border-bottom: 1px solid var(--color-border); background: var(--color-surface-subtle); }
+.evidence-results > header > div { display: flex; align-items: baseline; gap: var(--space-sm); }
+.evidence-results > header h1 { margin: 0; font-size: var(--type-label-size); line-height: var(--type-label-line); }
+/* A missing verdict names what is absent, why the pane is blank, and the one
+   command that fills it, so it never reads as a completed result. */
+.evidence-loading,
+.evidence-empty {
+  width: 100%;
+  padding: var(--space-xxl) var(--space-xl);
+  display: grid;
+  align-content: start;
+  justify-items: start;
+  gap: var(--space-sm);
+}
+.evidence-loading { color: var(--color-text-muted); }
+.evidence-empty h1 { margin: 0; font-size: var(--type-section-size); line-height: var(--type-section-line); letter-spacing: var(--type-section-track); }
+.evidence-empty p { max-width: 72ch; margin: 0; color: var(--color-text-muted); }
+.evidence-empty .evidence-empty-reason { border-left: 2px solid var(--color-warning); padding-left: var(--space-md); color: var(--color-warning); }
+.evidence-empty code { border: 1px solid var(--color-border); border-radius: var(--radius-xs); padding: 0 var(--space-xs); background: var(--color-surface); }
+.evidence-report { min-width: 0; display: grid; }
+.decision-summary { min-width: 0; border-bottom: 1px solid var(--color-border); }
+.decision-summary > header { min-height: 72px; padding: var(--space-md) var(--space-lg); display: flex; align-items: center; justify-content: space-between; gap: var(--space-lg); }
+.decision-summary > header h2 { max-width: 72ch; margin: var(--space-xs) 0 0; font-size: var(--type-section-size); line-height: var(--type-section-line); }
+.decision-summary > header > strong { flex: none; border-left: 2px solid currentColor; padding-left: var(--space-sm); text-transform: capitalize; }
+.decision-summary dl { margin: 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-top: 1px solid var(--color-border); }
+.decision-summary dl > div { min-width: 0; padding: var(--space-md) var(--space-lg); border-right: 1px solid var(--color-border); }
+.decision-summary dl > div:last-child { border-right: 0; }
+.decision-summary dt { color: var(--color-text-muted); }
+.decision-summary dd { margin: var(--space-xs) 0; font-size: var(--type-section-size); font-weight: var(--weight-semibold); line-height: var(--type-section-line); }
+.decision-summary dl small { display: block; color: var(--color-text-muted); }
+.evidence-table-pane { min-width: 0; border-bottom: 1px solid var(--color-border); }
+.evidence-table-pane .table-scroll { max-width: 100%; }
+.evidence-manifest { margin: 0; padding: var(--space-sm) var(--space-md); display: flex; gap: var(--space-sm); color: var(--color-text-muted); }
+.evidence-manifest code { color: var(--color-text); }
+
+@media (max-width: 1080px) {
+  .studio-control-plane { grid-template-columns: minmax(0, 1fr); }
+  /* An overlay has no docked edge to drag, and the toolbar toggle plus the
+     sidebar's own close button already cover hide and show here. */
+  .studio-sidebar-sash { display: none; }
+  .studio-sidebar-collapse { display: none; }
+  /* The sidebar is off-canvas at this width, so its slice of the band is gone and
+     the leading inset moves to the toolbar that now starts the window. */
+  [data-shell="desktop"][data-window-controls="left"] .studio-context-bar { padding-left: 78px; }
+  .studio-primary-nav {
+    width: var(--sidebar-width);
+    position: fixed;
+    inset-block: 0;
+    left: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transform: translateX(-101%);
+    transition: transform var(--motion-layout) ease, visibility 0s linear var(--motion-layout);
+  }
+  .studio-control-plane.navigation-open .studio-primary-nav { visibility: visible; pointer-events: auto; transform: translateX(0); transition-delay: 0s; box-shadow: var(--shadow-overlay); }
+  .studio-nav-backdrop { position: fixed; inset: 0; z-index: 25; border: 0; border-radius: var(--radius-none); background: var(--color-overlay); }
+  .studio-control-plane.navigation-open .studio-nav-backdrop { display: block; }
+  .studio-nav-toggle { display: grid; }
+  .studio-project-close { display: grid; }
+  .studio-project-remove { opacity: 1; }
+  .studio-context-bar.has-surface-navigation .studio-context-navigation { display: block; }
+  .studio-surface .builder-topbar .studio-tabs,
+  .studio-surface .notebook-navigation .studio-tabs,
+  .studio-surface .debugger-top-actions .studio-tabs,
+  .evidence-results > header .studio-tabs { display: none; }
+}
+
+@media (max-width: 760px) {
+
+  .studio-context-bar { padding-inline: var(--space-xs); gap: var(--space-sm); }
+  .studio-source-switcher > button { width: var(--toolbar-target); height: var(--toolbar-target); min-height: var(--toolbar-target); justify-content: center; padding: 0; }
+  .studio-source-switcher > button > span { display: none; }
+  .studio-source-switcher > button em { position: absolute; top: 1px; right: 1px; min-width: var(--space-md); min-height: var(--space-md); }
+  .studio-theme-toggle { width: var(--toolbar-target); height: var(--toolbar-target); min-height: var(--toolbar-target); justify-content: center; padding: 0; }
+  .studio-theme-toggle span { display: none; }
+  .studio-context-bar.has-surface-navigation .studio-context-title { display: none; }
+  .studio-context-bar.has-surface-navigation .studio-context-navigation { display: block; }
+  .studio-context-bar.has-surface-navigation .studio-context-navigation .studio-secondary-tabs { width: 100%; min-width: 0; }
+  .studio-secondary-tabs { min-width: 0; }
+  .studio-secondary-tabs button { padding-inline: var(--space-xs); }
+
+  /* The status bar has room for one fact at this width. The counts are the ones
+     to drop: the view's own status already names the count that matters here,
+     and keeping both truncated the scope to a single letter. */
+  .studio-status-counts { display: none; }
+
+  .decision-summary > header { align-items: flex-start; flex-direction: column; }
+  .decision-summary dl { grid-template-columns: 1fr 1fr; }
+  .decision-summary dl > div:nth-child(2) { border-right: 0; }
+  .decision-summary dl > div:nth-child(-n + 2) { border-bottom: 1px solid var(--color-border); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .studio-primary-nav { transition: none; }
+  .studio-project-spinner { animation: none; }
+}
+
+/* Shared source-list filters for Customizations and Memory. */
+.studio-facet-nav h2 { min-height: var(--pane-header-height); margin: 0; padding: var(--space-sm) var(--space-sm) var(--space-xs); display: flex; align-items: flex-end; color: var(--color-text-muted); font-size: var(--type-pane-size); font-weight: var(--weight-semibold); line-height: var(--type-pane-line); letter-spacing: var(--type-pane-track); }
+.studio-facet-nav button { width: 100%; min-height: var(--navigation-row-height); display: flex; align-items: center; gap: var(--space-sm); border: 0; border-radius: var(--radius-xs); padding: var(--space-xs) var(--space-sm); background: transparent; color: var(--color-text-muted); font-weight: var(--weight-regular); text-align: left; }
+.studio-facet-nav button > svg { flex: none; color: var(--color-text-muted); }
+.studio-facet-nav button > span { min-width: 0; flex: 1; overflow: hidden; color: inherit; font-size: var(--type-label-size); text-overflow: ellipsis; white-space: nowrap; }
+.studio-facet-nav small { flex: none; color: var(--color-text-subtle); font-size: var(--type-meta-size); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.studio-facet-status { color: var(--color-warning); }
+.studio-facet-nav button:hover { color: var(--color-text); background: var(--color-surface-hover); }
+.studio-facet-nav button:active { background: var(--color-surface-active); }
+/* The unfocused selection is the soft fill; a focused row takes the filled
+   source-list state instead of a detached control outline. */
+.studio-facet-nav button[aria-current] { color: var(--color-text); background: var(--color-surface-selected); }
+.studio-facet-nav button[aria-current] > span { font-weight: var(--weight-semibold); }
+.studio-facet-nav button[aria-current] > svg { color: currentColor; }
+.studio-facet-nav button:focus-visible { outline: none; color: var(--color-on-primary); background: var(--color-primary); }
+.studio-facet-nav button:focus-visible > svg,
+.studio-facet-nav button:focus-visible small { color: inherit; }

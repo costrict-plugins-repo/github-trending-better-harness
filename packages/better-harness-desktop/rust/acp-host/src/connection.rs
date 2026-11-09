@@ -1,0 +1,1150 @@
+//! Persistent ACP connections.
+//!
+//! One [`AgentConnection`] owns one agent subprocess and lives across many
+//! prompt turns, which is the whole point of this host: the previous Node
+//! executor tore the agent down after a single `session/prompt`.
+//!
+//! # Process lifetime
+//!
+//! Reaping is **not** implemented here. `AcpAgent` already spawns the child into
+//! its own process group and kills that group when its guard drops, so holding
+//! the driver task is what keeps the agent alive and dropping it is what
+//! collects the agent and any grandchildren it left behind.
+//!
+//! # Where work runs
+//!
+//! Registered handlers execute on the connection's event loop, so the loop
+//! cannot read the next message while a handler is awaiting. That is fine for
+//! the notification handler, which only folds an update into memory, but wrong
+//! for permission: it waits on a human. Permission therefore hands off to a
+//! detached task and answers from there, leaving the loop free.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt::Display;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::schema::v1::{
+    AuthenticateRequest, ListSessionsRequest, CancelNotification, ClientCapabilities, ContentBlock, CreateTerminalRequest,
+    FileSystemCapabilities, Implementation, InitializeRequest, KillTerminalRequest,
+    NewSessionRequest, LoadSessionRequest, ResumeSessionRequest, CloseSessionRequest, PromptRequest, ReadTextFileRequest, ReleaseTerminalRequest,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionConfigKind, SessionConfigOptionValue, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest, TerminalOutputRequest, TextContent,
+    WaitForTerminalExitRequest, WriteTextFileRequest,
+};
+use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client, ConnectionTo, LineDirection};
+use anyhow::{Result, anyhow};
+use tokio::sync::{mpsc, oneshot};
+
+use crate::fence::Fence;
+use crate::redact::redact;
+use crate::services::ClientServices;
+use crate::thread::{self, Change, ChunkKind, Thread};
+use crate::wire::{
+    ConfigOptionValue, ConnectionOpenParams, FrameDirection, HostEvent, MAX_DIAGNOSTIC_LINE_BYTES,
+    PermissionOption, TurnStatus,
+};
+
+/// Client identity reported in `initialize`.
+const CLIENT_NAME: &str = "better-harness-acp-host";
+
+/// Bound on buffered host events.
+///
+/// Deliberately finite, unlike Zed's foreground dispatch queue whose own
+/// comments note the missing backpressure. When this fills, the notification
+/// handler stops draining the agent's stdout, which throttles the agent instead
+/// of letting the host grow without limit.
+pub const EVENT_CHANNEL_CAPACITY: usize = 4096;
+
+/// Anything the host writes to stdout.
+///
+/// Events and replies share one queue on purpose. An event is caused by an agent
+/// notification that arrived *before* the response completing a call, so the
+/// event must reach stdout first. Routing them through separate queues let a
+/// reply overtake the event that preceded it: `session.prompt` answered
+/// `end_turn` while the assistant text was still one hop behind, and the caller
+/// closed the run with an empty output. One queue makes the ordering structural
+/// instead of a race the writer happens to win.
+#[derive(Debug)]
+pub enum Outbound {
+    Event(HostEvent),
+    /// An already encoded reply line, including its trailing newline.
+    Reply(String),
+}
+
+/// Bounded outlet for host events.
+#[derive(Clone)]
+pub struct EventSink {
+    sender: mpsc::Sender<Outbound>,
+}
+
+impl EventSink {
+    pub fn new(capacity: usize) -> (Self, mpsc::Receiver<Outbound>) {
+        let (sender, receiver) = mpsc::channel(capacity);
+        (Self { sender }, receiver)
+    }
+
+    /// The shared queue, so replies can be ordered against events.
+    pub fn outbound(&self) -> mpsc::Sender<Outbound> {
+        self.sender.clone()
+    }
+
+    /// Queue one event, waiting for room if the channel is full.
+    ///
+    /// A closed channel means the writer is gone and the host is shutting down,
+    /// so the event is dropped rather than treated as a failure.
+    pub async fn send(&self, event: HostEvent) {
+        let _ = self.sender.send(Outbound::Event(event)).await;
+    }
+
+    /// Queue one event from a synchronous context, dropping it if there is no room.
+    ///
+    /// The transport tap is a plain `Fn` callback on the crate's read path, so it
+    /// cannot await. Blocking there would stall the agent's stdout. Evidence
+    /// frames are already capped downstream, so shedding them under pressure is
+    /// the established contract; the transcript never travels this way.
+    pub fn try_send(&self, event: HostEvent) -> bool {
+        self.sender.try_send(Outbound::Event(event)).is_ok()
+    }
+}
+
+/// Per-connection cap on retained Agent stderr lines.
+const MAX_DIAGNOSTIC_LINES: usize = 40;
+
+/// Per-connection cap on retained Agent stderr bytes.
+const MAX_DIAGNOSTIC_BYTES: usize = 4 * 1024;
+
+/// Clip one streamed stderr line, on a character boundary.
+///
+/// The retained tail is bounded as a whole; a streamed line has to be bounded
+/// on its own, because nothing downstream aggregates before showing it.
+fn truncate_diagnostic(line: &str) -> String {
+    if line.len() <= MAX_DIAGNOSTIC_LINE_BYTES {
+        return line.to_string();
+    }
+    let mut end = MAX_DIAGNOSTIC_LINE_BYTES;
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &line[..end])
+}
+
+/// Grace period for the crate's stderr reader to deliver its last lines.
+///
+/// stdout EOF is what fails the handshake, and stderr is drained by a separate
+/// task. Without a bounded wait the tail is often still in flight, so the error
+/// would lose exactly the text that explains it.
+const DIAGNOSTIC_DRAIN_GRACE: Duration = Duration::from_millis(300);
+
+/// A bounded tail of the Agent's own stderr, kept for failure reporting.
+///
+/// The transport tap is the only place the crate exposes an Agent's diagnostics,
+/// and [`protocol_frame`] deliberately drops stderr because it is not protocol.
+/// Without this, an Agent that rejects its own configuration and exits leaves
+/// `open` reporting `Incoming transport closed`, which names the symptom and not
+/// the cause. Bounded, and it decorates the error the caller already receives,
+/// matching what the Node executor does with the same stream.
+///
+/// The same lines are *also* streamed as [`HostEvent::AgentDiagnostic`]. This
+/// tail answers "why did it fail"; the stream answers "is it still working",
+/// which an Agent spending minutes preparing a microVM cannot otherwise say.
+#[derive(Clone, Default)]
+pub struct AgentDiagnostics {
+    lines: Arc<Mutex<VecDeque<String>>>,
+}
+
+impl AgentDiagnostics {
+    /// Retain one stderr line, dropping the oldest once either bound is reached.
+    fn push(&self, line: &str) {
+        let line = line.trim_end();
+        if line.is_empty() {
+            return;
+        }
+        let mut lines = self.lines.lock().expect("agent diagnostics");
+        lines.push_back(line.to_owned());
+        while lines.len() > MAX_DIAGNOSTIC_LINES
+            || lines.iter().map(|line| line.len() + 1).sum::<usize>() > MAX_DIAGNOSTIC_BYTES
+        {
+            if lines.pop_front().is_none() {
+                break;
+            }
+        }
+    }
+
+    fn tail(&self) -> String {
+        self.lines
+            .lock()
+            .expect("agent diagnostics")
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Build an error that carries the Agent's own words when it wrote any.
+    fn explain(&self, message: impl Display) -> anyhow::Error {
+        let tail = self.tail();
+        if tail.is_empty() {
+            anyhow!("{message}")
+        } else {
+            anyhow!("{message}\n{tail}")
+        }
+    }
+
+    /// Wait briefly for a still-draining stderr tail, then explain the failure.
+    async fn explain_when_drained(&self, message: impl Display) -> anyhow::Error {
+        let deadline = tokio::time::Instant::now() + DIAGNOSTIC_DRAIN_GRACE;
+        while self.tail().is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        self.explain(message)
+    }
+}
+
+/// A permission request the agent is blocked on.
+struct PendingPermission {
+    /// Options the agent offered. A decision naming anything else is refused,
+    /// because the host must not invent an outcome the agent cannot interpret.
+    option_ids: HashSet<String>,
+    responder: oneshot::Sender<Option<String>>,
+}
+
+/// Outstanding permission requests across one connection's sessions.
+#[derive(Clone, Default)]
+pub struct PermissionStore {
+    pending: Arc<Mutex<HashMap<String, PendingPermission>>>,
+}
+
+impl PermissionStore {
+    fn register(
+        &self,
+        request_id: String,
+        option_ids: HashSet<String>,
+    ) -> oneshot::Receiver<Option<String>> {
+        let (responder, receiver) = oneshot::channel();
+        self.pending.lock().expect("permission store").insert(
+            request_id,
+            PendingPermission {
+                option_ids,
+                responder,
+            },
+        );
+        receiver
+    }
+
+    /// Answer a pending request.
+    ///
+    /// Removing the entry is what makes a decision single-use: a second call for
+    /// the same id finds nothing and reports it, rather than racing the first.
+    pub fn decide(&self, request_id: &str, option_id: Option<&str>) -> Result<()> {
+        let mut pending = self.pending.lock().expect("permission store");
+        let entry = pending
+            .get(request_id)
+            .ok_or_else(|| anyhow!("no permission request is pending for this id"))?;
+        if let Some(option_id) = option_id
+            && !entry.option_ids.contains(option_id)
+        {
+            return Err(anyhow!(
+                "optionId must name one of the options the agent offered"
+            ));
+        }
+        let entry = pending
+            .remove(request_id)
+            .expect("entry was present under this lock");
+        drop(pending);
+        // A dropped receiver means the turn already ended; the decision is moot
+        // rather than an error worth surfacing to the caller.
+        let _ = entry.responder.send(option_id.map(str::to_owned));
+        Ok(())
+    }
+
+    /// Cancel everything still pending, used when a connection goes away.
+    fn cancel_all(&self) -> Vec<String> {
+        let mut pending = self.pending.lock().expect("permission store");
+        pending
+            .drain()
+            .map(|(request_id, entry)| {
+                let _ = entry.responder.send(None);
+                request_id
+            })
+            .collect()
+    }
+}
+
+/// Per-session transcripts for one connection.
+type SharedThreads = Arc<Mutex<HashMap<String, Thread>>>;
+
+/// One live ACP connection.
+pub struct AgentConnection {
+    capabilities: serde_json::Value,
+    auth_methods: serde_json::Value,
+    id: String,
+    connection: ConnectionTo<Agent>,
+    services: ClientServices,
+    permissions: PermissionStore,
+    threads: SharedThreads,
+    /// Holding this task holds the agent process. `Drop` explicitly aborts it;
+    /// dropping a Tokio JoinHandle alone only detaches and would leak both the
+    /// Agent and the EventSink clone that keeps the stdout writer alive.
+    driver: tokio::task::JoinHandle<()>,
+}
+
+impl AgentConnection {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn fence(&self) -> &Fence {
+        self.services.fence()
+    }
+
+    pub fn permissions(&self) -> &PermissionStore {
+        &self.permissions
+    }
+
+    /// Spawn an agent and complete the ACP handshake.
+    pub async fn open(params: &ConnectionOpenParams, events: EventSink) -> Result<Self> {
+        let id = params.connection_id.clone();
+        let services = ClientServices::new(Fence::new(&params.allow_roots));
+        let permissions = PermissionStore::default();
+        let threads: SharedThreads = Arc::new(Mutex::new(HashMap::new()));
+
+        let diagnostics = AgentDiagnostics::default();
+        let agent = AcpAgent::new(
+            AcpAgentConfig::new(params.command.clone())
+                .args(params.args.clone())
+                .envs(params.env.clone()),
+        )
+        .with_debug({
+            // The crate hands every transport line to this callback, which is the
+            // only place raw JSON-RPC is observable. Retaining it here keeps the
+            // evidence trace identical in shape to the Node executor's.
+            let tap = events.clone();
+            let tapped_connection = id.clone();
+            let tapped_diagnostics = diagnostics.clone();
+            move |line: &str, direction: LineDirection| {
+                // Stderr is not protocol, so it never becomes a frame; it is the
+                // only channel that explains why a handshake died.
+                if matches!(direction, LineDirection::Stderr) {
+                    tapped_diagnostics.push(line);
+                    // Streamed as well as retained: until the Agent answers
+                    // `initialize` this is the only thing that can tell a reader
+                    // it is working rather than wedged. Shed under pressure —
+                    // `try_send` on a full channel drops, and losing a progress
+                    // line is better than stalling the Agent's stdout to deliver
+                    // it.
+                    let trimmed = line.trim_end();
+                    if !trimmed.is_empty() {
+                        tap.try_send(HostEvent::AgentDiagnostic {
+                            connection_id: tapped_connection.clone(),
+                            line: truncate_diagnostic(trimmed),
+                        });
+                    }
+                    return;
+                }
+                if let Some(event) = protocol_frame(&tapped_connection, line, direction) {
+                    tap.try_send(event);
+                }
+            }
+        });
+
+        let (connection_tx, connection_rx) = oneshot::channel();
+        let notification_state = (id.clone(), threads.clone(), events.clone());
+        let permission_state = (id.clone(), permissions.clone(), events.clone());
+        let read_services = services.clone();
+        let write_services = services.clone();
+        let create_terminal_services = services.clone();
+        let output_services = services.clone();
+        let kill_terminal_services = services.clone();
+        let release_terminal_services = services.clone();
+        let wait_terminal_services = services.clone();
+        let lost_state = (id.clone(), permissions.clone(), events.clone());
+
+        let driver = tokio::spawn(async move {
+            let (notification_id, notification_threads, notification_events) = notification_state;
+            let (permission_id, permission_store, permission_events) = permission_state;
+            let outcome = Client
+                .builder()
+                .on_receive_request(
+                    async move |request: ReadTextFileRequest, responder, _connection| {
+                        let services = read_services.clone();
+                        tokio::spawn(async move {
+                            match services.read_text_file(request).await {
+                                Ok(response) => {
+                                    let _ = responder.respond(response);
+                                }
+                                Err(error) => {
+                                    let _ = responder.respond_with_error(error);
+                                }
+                            }
+                        });
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |request: WriteTextFileRequest, responder, _connection| {
+                        let services = write_services.clone();
+                        tokio::spawn(async move {
+                            match services.write_text_file(request).await {
+                                Ok(response) => {
+                                    let _ = responder.respond(response);
+                                }
+                                Err(error) => {
+                                    let _ = responder.respond_with_error(error);
+                                }
+                            }
+                        });
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |request: CreateTerminalRequest, responder, _connection| {
+                        let services = create_terminal_services.clone();
+                        tokio::spawn(async move {
+                            match services.create_terminal(request).await {
+                                Ok(response) => {
+                                    let _ = responder.respond(response);
+                                }
+                                Err(error) => {
+                                    let _ = responder.respond_with_error(error);
+                                }
+                            }
+                        });
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |request: TerminalOutputRequest, responder, _connection| {
+                        let services = output_services.clone();
+                        tokio::spawn(async move {
+                            match services.terminal_output(request).await {
+                                Ok(response) => {
+                                    let _ = responder.respond(response);
+                                }
+                                Err(error) => {
+                                    let _ = responder.respond_with_error(error);
+                                }
+                            }
+                        });
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |request: KillTerminalRequest, responder, _connection| {
+                        let services = kill_terminal_services.clone();
+                        tokio::spawn(async move {
+                            match services.kill_terminal(request).await {
+                                Ok(response) => {
+                                    let _ = responder.respond(response);
+                                }
+                                Err(error) => {
+                                    let _ = responder.respond_with_error(error);
+                                }
+                            }
+                        });
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |request: ReleaseTerminalRequest, responder, _connection| {
+                        let services = release_terminal_services.clone();
+                        tokio::spawn(async move {
+                            match services.release_terminal(request).await {
+                                Ok(response) => {
+                                    let _ = responder.respond(response);
+                                }
+                                Err(error) => {
+                                    let _ = responder.respond_with_error(error);
+                                }
+                            }
+                        });
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |request: WaitForTerminalExitRequest, responder, _connection| {
+                        let services = wait_terminal_services.clone();
+                        tokio::spawn(async move {
+                            match services.wait_for_terminal_exit(request).await {
+                                Ok(response) => {
+                                    let _ = responder.respond(response);
+                                }
+                                Err(error) => {
+                                    let _ = responder.respond_with_error(error);
+                                }
+                            }
+                        });
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_notification(
+                    async move |notification: SessionNotification, _connection| {
+                        apply_session_notification(
+                            &notification_id,
+                            &notification_threads,
+                            &notification_events,
+                            notification,
+                        )
+                        .await;
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_notification!(),
+                )
+                .on_receive_request(
+                    async move |request: RequestPermissionRequest, responder, _connection| {
+                        // Detached because this waits on a person. Answering
+                        // inline would hold the event loop for the whole wait.
+                        let connection_id = permission_id.clone();
+                        let store = permission_store.clone();
+                        let events = permission_events.clone();
+                        tokio::spawn(async move {
+                            let outcome =
+                                await_permission(&connection_id, &store, &events, &request).await;
+                            let _ = responder.respond(RequestPermissionResponse::new(outcome));
+                        });
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .connect_with(agent, move |connection: ConnectionTo<Agent>| async move {
+                    // Hand the connection out, then never return: returning here
+                    // is what would close the transport, and this host exists to
+                    // keep it open across turns.
+                    let _ = connection_tx.send(connection);
+                    futures::future::pending::<Result<(), agent_client_protocol::Error>>().await
+                })
+                .await;
+
+            let (lost_id, lost_permissions, lost_events) = lost_state;
+            // The agent is gone, so anything still waiting on it never will be
+            // answered. Release those waiters before announcing the loss.
+            for request_id in lost_permissions.cancel_all() {
+                lost_events
+                    .send(HostEvent::PermissionResolved {
+                        request_id,
+                        outcome: "cancelled".to_owned(),
+                    })
+                    .await;
+            }
+            lost_events
+                .send(HostEvent::ConnectionLost {
+                    connection_id: lost_id,
+                    detail: outcome.err().map(|error| error.to_string()),
+                })
+                .await;
+        });
+
+        let connection = match connection_rx.await {
+            Ok(connection) => connection,
+            Err(_) => {
+                return Err(diagnostics
+                    .explain_when_drained(
+                        "the ACP transport closed before it produced a connection",
+                    )
+                    .await);
+            }
+        };
+
+        let initialized = connection
+            .send_request(
+                InitializeRequest::new(ProtocolVersion::V1)
+                    .client_capabilities(
+                        ClientCapabilities::new()
+                            .fs(FileSystemCapabilities::new()
+                                .read_text_file(true)
+                                .write_text_file(true))
+                            .terminal(true),
+                    )
+                    .client_info(Implementation::new(CLIENT_NAME, env!("CARGO_PKG_VERSION"))),
+            )
+            .block_task()
+            .await;
+        if let Err(error) = initialized {
+            // An Agent that refuses its own configuration dies here, and the
+            // transport error alone only says the pipe closed. Its stderr is
+            // what names the file, line, and setting to fix.
+            return Err(diagnostics
+                .explain_when_drained(format!("ACP initialize failed: {error}"))
+                .await);
+        }
+
+        let initialized = initialized?;
+        let auth_methods = serde_json::to_value(&initialized.auth_methods)?;
+        let capabilities = serde_json::to_value(initialized.agent_capabilities)?;
+        Ok(Self {
+            capabilities,
+            auth_methods,
+            id,
+            connection,
+            services,
+            permissions,
+            threads,
+            driver,
+        })
+    }
+
+    pub fn initialization(&self) -> serde_json::Value {
+        serde_json::json!({ "agentCapabilities": self.capabilities, "authMethods": self.auth_methods })
+    }
+
+    pub async fn list_sessions(&self, cwd: Option<std::path::PathBuf>, cursor: Option<String>) -> Result<serde_json::Value> {
+        if !self.capabilities["sessionCapabilities"]["list"].is_object() { return Err(anyhow!("This Agent does not support session/list.")); }
+        if cwd.as_ref().is_some_and(|path| !path.is_absolute()) { return Err(anyhow!("Session cwd must be an absolute path.")); }
+        let result = self.connection.send_request(ListSessionsRequest::new().cwd(cwd).cursor(cursor)).block_task().await?;
+        Ok(serde_json::to_value(result)?)
+    }
+
+    pub async fn authenticate(&self, method_id: &str) -> Result<serde_json::Value> {
+        let offered = self.auth_methods.as_array().is_some_and(|methods| methods.iter().any(|method| {
+            method["id"].as_str() == Some(method_id) && (method.get("type").is_none() || method["type"].as_str() == Some("agent"))
+        }));
+        if !offered { return Err(anyhow!("This authentication method is not supported by this connection.")); }
+        let result = self.connection.send_request(AuthenticateRequest::new(method_id.to_owned())).block_task().await?;
+        Ok(serde_json::to_value(result)?)
+    }
+
+    /// Create a session and start tracking its transcript.
+    pub async fn create_session(&self, cwd: &std::path::Path) -> Result<String> {
+        let response = self
+            .connection
+            .send_request(NewSessionRequest::new(cwd.to_path_buf()))
+            .block_task()
+            .await
+            .map_err(|error| anyhow!("ACP session/new failed: {error}"))?;
+        let session_id = response.session_id.0.to_string();
+        self.threads
+            .lock()
+            .expect("threads")
+            .insert(session_id.clone(), Thread::new());
+        Ok(session_id)
+    }
+
+    pub async fn recover_session(&self, cwd: &std::path::Path, recovery: &crate::wire::SessionRecovery) -> Result<String> {
+        let can_load = self.capabilities["loadSession"].as_bool() == Some(true);
+        let can_resume = self.capabilities["sessionCapabilities"]["resume"].is_object();
+        let resume = recovery.method.as_deref() == Some("resume") || !can_load;
+        if (resume && !can_resume) || (!resume && !can_load) { return Err(anyhow!("This Agent cannot restore a previous session.")); }
+        let id = recovery.session_id.clone();
+        self.threads.lock().expect("threads").insert(id.clone(), Thread::new());
+        let result = if resume {
+            self.connection.send_request(ResumeSessionRequest::new(id.clone(), cwd.to_path_buf())).block_task().await.map(|_| ())
+        } else {
+            self.connection.send_request(LoadSessionRequest::new(id.clone(), cwd.to_path_buf())).block_task().await.map(|_| ())
+        };
+        if let Err(error) = result { self.threads.lock().expect("threads").remove(&id); return Err(anyhow!("ACP session recovery failed: {error}")); }
+        Ok(id)
+    }
+
+    pub async fn close_session(&self, id: &str) -> Result<()> {
+        if self.capabilities["sessionCapabilities"]["close"].is_object() {
+            self.connection.send_request(CloseSessionRequest::new(id.to_owned())).block_task().await.map_err(|error| anyhow!("ACP session/close failed: {error}"))?;
+        }
+        self.threads.lock().expect("threads").remove(id);
+        Ok(())
+    }
+
+    /// Run one prompt turn. A connection serves any number of these.
+    pub async fn prompt(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        events: &EventSink,
+    ) -> Result<String> {
+        self.prompt_content(session_id, vec![ContentBlock::Text(TextContent::new(prompt.to_owned()))], events).await
+    }
+
+    pub async fn prompt_content(&self, session_id: &str, content: Vec<ContentBlock>, events: &EventSink) -> Result<String> {
+        let prompt = content.iter().filter_map(|block| match block { ContentBlock::Text(text) => Some(text.text.as_str()), _ => None }).collect::<Vec<_>>().join("\n");
+        // Scoped so the guard is released before the first await below. A
+        // std::sync guard held across an await would make this future non-Send
+        // and could deadlock a task that re-enters the same lock.
+        let known = {
+            let threads = self.threads.lock().expect("threads");
+            threads.contains_key(session_id)
+        };
+        if !known {
+            return Err(anyhow!("unknown session"));
+        }
+        let change = self.with_thread(session_id, |thread| thread.push_user_message(&prompt));
+        self.announce(session_id, change, events).await;
+        events
+            .send(HostEvent::StatusChanged {
+                connection_id: self.id.clone(),
+                session_id: session_id.to_owned(),
+                status: TurnStatus::Running,
+                stop_reason: None,
+            })
+            .await;
+
+        let response = self
+            .connection
+            .send_request(PromptRequest::new(
+                session_id.to_owned(),
+                content,
+            ))
+            .block_task()
+            .await;
+
+        match response {
+            Ok(response) => {
+                let stop_reason = wire_name(&response.stop_reason);
+                // The agent owes no final update for calls it abandoned, so
+                // settle them here or the UI spins forever.
+                let terminal = if stop_reason == "end_turn" {
+                    thread::ToolCallStatus::Failed
+                } else {
+                    thread::ToolCallStatus::Canceled
+                };
+                // Collected under the lock, then awaited after releasing it: the
+                // guard must not survive into the announce loop below.
+                let settled = {
+                    let mut threads = self.threads.lock().expect("threads");
+                    threads
+                        .get_mut(session_id)
+                        .map(|thread| thread.settle_unfinished_tool_calls(terminal))
+                        .unwrap_or_default()
+                };
+                for index in settled {
+                    self.announce(session_id, Some(Change::Updated(index)), events)
+                        .await;
+                }
+                events
+                    .send(HostEvent::StatusChanged {
+                        connection_id: self.id.clone(),
+                        session_id: session_id.to_owned(),
+                        status: TurnStatus::Stopped,
+                        stop_reason: Some(stop_reason.clone()),
+                    })
+                    .await;
+                Ok(stop_reason)
+            }
+            Err(error) => {
+                events
+                    .send(HostEvent::StatusChanged {
+                        connection_id: self.id.clone(),
+                        session_id: session_id.to_owned(),
+                        status: TurnStatus::Failed,
+                        stop_reason: None,
+                    })
+                    .await;
+                Err(anyhow!("ACP session/prompt failed: {error}"))
+            }
+        }
+    }
+
+    pub async fn set_mode(&self, session_id: &str, mode_id: &str) -> Result<serde_json::Value> {
+        let response = self.connection
+            .send_request(SetSessionModeRequest::new(session_id.to_owned(), mode_id.to_owned()))
+            .block_task().await
+            .map_err(|error| anyhow!("ACP session/set_mode failed: {error}"))?;
+        Ok(serde_json::to_value(&response)?)
+    }
+
+    /// Apply one session config option and confirm the agent took it.
+    ///
+    /// Acknowledgement is verified rather than assumed, preserving the contract
+    /// the Node executor already enforced: an agent that silently ignores a
+    /// requested model would otherwise produce a run whose receipt claims a
+    /// setting the agent never honoured.
+    pub async fn set_config_option(
+        &self,
+        session_id: &str,
+        config_id: &str,
+        value: &ConfigOptionValue,
+    ) -> Result<serde_json::Value> {
+        let requested = match value {
+            ConfigOptionValue::Boolean(flag) => SessionConfigOptionValue::boolean(*flag),
+            ConfigOptionValue::Text(text) => SessionConfigOptionValue::value_id(text.clone()),
+        };
+        let response = self
+            .connection
+            .send_request(SetSessionConfigOptionRequest::new(
+                session_id.to_owned(),
+                config_id.to_owned(),
+                requested,
+            ))
+            .block_task()
+            .await
+            .map_err(|error| anyhow!("ACP session/set_config_option failed: {error}"))?;
+
+        let reported = response
+            .config_options
+            .iter()
+            .find(|option| option.id.0.as_ref() == config_id)
+            .ok_or_else(|| anyhow!("the agent did not acknowledge session option '{config_id}'"))?;
+        // The wire enum is non-exhaustive. A kind this host cannot read is not the
+        // same failure as a refused option, and saying so keeps the caller from
+        // chasing an agent bug that is really a schema gap here.
+        let observed = match &reported.kind {
+            SessionConfigKind::Boolean(boolean) => {
+                ConfigOptionValue::Boolean(boolean.current_value)
+            }
+            SessionConfigKind::Select(select) => {
+                ConfigOptionValue::Text(select.current_value.0.to_string())
+            }
+            _ => {
+                return Err(anyhow!(
+                    "the agent reported session option '{config_id}' in a form this host cannot verify"
+                ));
+            }
+        };
+        if observed == *value {
+            Ok(serde_json::to_value(&response)?)
+        } else {
+            Err(anyhow!(
+                "the agent did not acknowledge session option '{config_id}'"
+            ))
+        }
+    }
+
+    /// Ask the agent to abandon the in-flight turn.
+    ///
+    /// Notifications are fire-and-forget by protocol, so this returns as soon as
+    /// the frame is queued; the turn ends when the agent's prompt response lands.
+    pub fn cancel(&self, session_id: &str) -> Result<()> {
+        self.connection
+            .send_notification(CancelNotification::new(session_id.to_owned()))
+            .map_err(|error| anyhow!("ACP session/cancel failed: {error}"))
+    }
+
+    /// Snapshot one session's transcript.
+    pub fn entries(&self, session_id: &str) -> Option<Vec<thread::Entry>> {
+        self.threads
+            .lock()
+            .expect("threads")
+            .get(session_id)
+            .map(|thread| thread.entries().to_vec())
+    }
+
+    fn with_thread<T>(&self, session_id: &str, apply: impl FnOnce(&mut Thread) -> T) -> Option<T> {
+        self.threads
+            .lock()
+            .expect("threads")
+            .get_mut(session_id)
+            .map(apply)
+    }
+
+    async fn announce(&self, session_id: &str, change: Option<Change>, events: &EventSink) {
+        let Some(change) = change else { return };
+        announce_change(&self.id, session_id, &self.threads, change, events).await;
+    }
+}
+
+impl Drop for AgentConnection {
+    fn drop(&mut self) {
+        // Tokio JoinHandle::drop detaches — it does not cancel. Detaching here
+        // leaks the connection future, the agent process, and the EventSink
+        // clone that keeps the stdout writer waiting forever on shutdown.
+        self.driver.abort();
+        self.permissions.cancel_all();
+    }
+}
+
+/// Turn one transcript change into the matching host event.
+async fn announce_change(
+    connection_id: &str,
+    session_id: &str,
+    threads: &SharedThreads,
+    change: Change,
+    events: &EventSink,
+) {
+    let index = match change {
+        Change::Appended(index) | Change::Updated(index) => index,
+        Change::None => return,
+    };
+    let entry = threads
+        .lock()
+        .expect("threads")
+        .get(session_id)
+        .and_then(|thread| thread.entry(index).cloned());
+    let Some(entry) = entry else { return };
+    let payload = match serde_json::to_value(&entry) {
+        Ok(payload) => payload,
+        Err(_) => return,
+    };
+    let event = match change {
+        Change::Appended(index) => HostEvent::EntryAppended {
+            connection_id: connection_id.to_owned(),
+            session_id: session_id.to_owned(),
+            index,
+            entry: payload,
+        },
+        Change::Updated(index) => HostEvent::EntryUpdated {
+            connection_id: connection_id.to_owned(),
+            session_id: session_id.to_owned(),
+            index,
+            entry: payload,
+        },
+        Change::None => return,
+    };
+    events.send(event).await;
+}
+
+/// Fold one `session/update` into the session's transcript.
+async fn apply_session_notification(
+    connection_id: &str,
+    threads: &SharedThreads,
+    events: &EventSink,
+    notification: SessionNotification,
+) {
+    let session_id = notification.session_id.0.to_string();
+    let change = {
+        let mut guard = threads.lock().expect("threads");
+        let Some(thread) = guard.get_mut(&session_id) else {
+            // An update for a session this host never created has nowhere to go.
+            return;
+        };
+        match notification.update {
+            SessionUpdate::UserMessageChunk(chunk) => thread.push_content(serde_json::to_value(&chunk.content).unwrap_or_default(), "user", chunk.message_id.as_ref().map(|id| id.0.as_ref())),
+            SessionUpdate::AgentMessageChunk(chunk) => {
+                if let Some(text) = block_text(&chunk.content) {
+                thread.push_agent_text(
+                    ChunkKind::Message,
+                    chunk.message_id.as_ref().map(|id| id.0.as_ref()),
+                    text,
+                )
+                } else { thread.push_content(serde_json::to_value(&chunk.content).unwrap_or_default(), "assistant", chunk.message_id.as_ref().map(|id| id.0.as_ref())) }
+            }
+            SessionUpdate::AgentThoughtChunk(chunk) => {
+                if let Some(text) = block_text(&chunk.content) {
+                thread.push_agent_text(
+                    ChunkKind::Thought,
+                    chunk.message_id.as_ref().map(|id| id.0.as_ref()),
+                    text,
+                )
+                } else { thread.push_content(serde_json::to_value(&chunk.content).unwrap_or_default(), "thought", chunk.message_id.as_ref().map(|id| id.0.as_ref())) }
+            }
+            SessionUpdate::ToolCall(call) => thread.upsert_tool_call(thread::ToolCallUpdate {
+                tool_call_id: call.tool_call_id.0.as_ref(),
+                title: Some(call.title.as_str()),
+                status: Some(map_tool_status(&call.status)),
+                raw_input: call.raw_input.clone(),
+                raw_output: call.raw_output.clone(),
+            }),
+            SessionUpdate::ToolCallUpdate(update) => {
+                let title = update.fields.title.clone();
+                thread.upsert_tool_call(thread::ToolCallUpdate {
+                    tool_call_id: update.tool_call_id.0.as_ref(),
+                    title: title.as_deref(),
+                    status: update.fields.status.as_ref().map(map_tool_status),
+                    raw_input: update.fields.raw_input.clone(),
+                    raw_output: update.fields.raw_output.clone(),
+                })
+            }
+            // Plan, usage, mode, and config updates are session-level rather
+            // than transcript rows; they are reported once their owners exist.
+            _ => Change::None,
+        }
+    };
+    announce_change(connection_id, &session_id, threads, change, events).await;
+}
+
+/// Turn one raw transport line into a redacted protocol frame event.
+///
+/// Returns `None` for stderr and for anything that is not a JSON-RPC object, so
+/// agent logging never enters the evidence trace as if it were protocol.
+fn protocol_frame(connection_id: &str, line: &str, direction: LineDirection) -> Option<HostEvent> {
+    let direction = match direction {
+        LineDirection::Stdin => FrameDirection::ClientToAgent,
+        LineDirection::Stdout => FrameDirection::AgentToClient,
+        // Stderr is diagnostics, not protocol.
+        _ => return None,
+    };
+    let parsed: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    let object = parsed.as_object()?;
+    let rpc_id = object.get("id").map(|id| match id {
+        serde_json::Value::String(text) => text.clone(),
+        other => other.to_string(),
+    });
+    // A frame with no method is a response. Naming it after the request it
+    // answers would need correlation state on the read path, so it is reported
+    // plainly and the rpc id is what pairs the two.
+    let method = object
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("response")
+        .to_owned();
+    let session_id = object
+        .get("params")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|params| params.get("sessionId"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    Some(HostEvent::ProtocolFrame {
+        connection_id: connection_id.to_owned(),
+        direction,
+        method,
+        rpc_id,
+        session_id,
+        // Redacted before it leaves this function, so no caller can forget.
+        payload: redact(parsed),
+    })
+}
+
+/// Render a protocol enum using its own wire spelling.
+///
+/// `Debug` is not a substitute: it would turn `EndTurn` into `endturn` while the
+/// protocol, and therefore every consumer downstream of this host, says
+/// `end_turn`. Serializing asks the schema what the value is called.
+fn wire_name<T: serde::Serialize>(value: &T) -> String {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(name)) => name,
+        // Non-string variants carry data; fall back to a compact rendering
+        // rather than inventing a name for them.
+        Ok(other) => other.to_string(),
+        Err(_) => String::new(),
+    }
+}
+
+/// Extract renderable text, if this block carries any.
+fn block_text(block: &ContentBlock) -> Option<&str> {
+    match block {
+        ContentBlock::Text(text) => Some(text.text.as_str()),
+        _ => None,
+    }
+}
+
+fn map_tool_status(
+    status: &agent_client_protocol::schema::v1::ToolCallStatus,
+) -> thread::ToolCallStatus {
+    use agent_client_protocol::schema::v1::ToolCallStatus as Wire;
+    match status {
+        Wire::Pending => thread::ToolCallStatus::Pending,
+        Wire::InProgress => thread::ToolCallStatus::InProgress,
+        Wire::Completed => thread::ToolCallStatus::Completed,
+        Wire::Failed => thread::ToolCallStatus::Failed,
+        // The wire enum may grow; an unrecognised status is still in flight
+        // rather than silently terminal.
+        _ => thread::ToolCallStatus::InProgress,
+    }
+}
+
+/// Publish a permission request and wait for the host runtime to answer it.
+async fn await_permission(
+    connection_id: &str,
+    store: &PermissionStore,
+    events: &EventSink,
+    request: &RequestPermissionRequest,
+) -> RequestPermissionOutcome {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let option_ids: HashSet<String> = request
+        .options
+        .iter()
+        .map(|option| option.option_id.0.to_string())
+        .collect();
+    let receiver = store.register(request_id.clone(), option_ids);
+    let session_id = request.session_id.0.to_string();
+    let tool_call_id = request.tool_call.tool_call_id.0.to_string();
+    events
+        .send(HostEvent::PermissionRequested {
+            connection_id: connection_id.to_owned(),
+            session_id: session_id.clone(),
+            request_id: request_id.clone(),
+            tool_call_id,
+            title: request
+                .tool_call
+                .fields
+                .title
+                .clone()
+                .unwrap_or_else(|| "Agent action".to_owned()),
+            options: request
+                .options
+                .iter()
+                .map(|option| PermissionOption {
+                    option_id: option.option_id.0.to_string(),
+                    name: option.name.clone(),
+                    kind: wire_name(&option.kind),
+                })
+                .collect(),
+        })
+        .await;
+
+    // No timeout: a permission prompt waits for a person. Timing out would let
+    // an agent silently proceed differently than the user intended.
+    let decision = receiver.await.unwrap_or(None);
+    let outcome = match &decision {
+        Some(option_id) => {
+            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(option_id.clone()))
+        }
+        None => RequestPermissionOutcome::Cancelled,
+    };
+    events
+        .send(HostEvent::PermissionResolved {
+            request_id,
+            outcome: decision.unwrap_or_else(|| "cancelled".to_owned()),
+        })
+        .await;
+    outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explains_a_failure_with_the_agent_own_words() {
+        let diagnostics = AgentDiagnostics::default();
+        diagnostics.push("error loading config: config.toml:10:16: unknown variant `default`");
+        let error = diagnostics.explain("ACP initialize failed: Incoming transport closed");
+        let reported = error.to_string();
+        assert!(
+            reported.contains("unknown variant `default`"),
+            "the agent's own reason must reach the caller, got {reported}"
+        );
+        assert!(
+            reported.starts_with("ACP initialize failed:"),
+            "the transport failure must still lead, got {reported}"
+        );
+    }
+
+    #[test]
+    fn reports_the_failure_alone_when_the_agent_said_nothing() {
+        let error = AgentDiagnostics::default().explain("ACP initialize failed");
+        assert_eq!(error.to_string(), "ACP initialize failed");
+    }
+
+    #[test]
+    fn drops_blank_stderr_lines_rather_than_padding_the_tail() {
+        let diagnostics = AgentDiagnostics::default();
+        diagnostics.push("");
+        diagnostics.push("   \n");
+        assert_eq!(diagnostics.tail(), "");
+    }
+
+    #[test]
+    fn keeps_the_newest_lines_within_the_line_bound() {
+        let diagnostics = AgentDiagnostics::default();
+        for index in 0..(MAX_DIAGNOSTIC_LINES * 2) {
+            diagnostics.push(&format!("line {index}"));
+        }
+        let tail = diagnostics.tail();
+        let lines: Vec<&str> = tail.lines().collect();
+        assert_eq!(lines.len(), MAX_DIAGNOSTIC_LINES);
+        // The last thing an agent said before dying is the part worth keeping.
+        assert_eq!(
+            *lines.last().expect("a retained line"),
+            format!("line {}", MAX_DIAGNOSTIC_LINES * 2 - 1)
+        );
+    }
+
+    #[test]
+    fn keeps_the_tail_within_the_byte_bound() {
+        let diagnostics = AgentDiagnostics::default();
+        for _ in 0..8 {
+            diagnostics.push(&"x".repeat(1_024));
+        }
+        assert!(
+            diagnostics.tail().len() <= MAX_DIAGNOSTIC_BYTES,
+            "a chatty agent must not grow the retained tail without limit"
+        );
+    }
+}

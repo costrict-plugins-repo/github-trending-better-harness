@@ -1,0 +1,317 @@
+import type { TFunction } from "i18next";
+
+export type StudioArea =
+  | "memory"
+  | "memory-sources"
+  | "customizations"
+  | "session-performance"
+  | "sessions"
+  | "commits"
+  | "impact"
+  | "artifacts"
+  | "components"
+  | "terminal"
+  | "debugger"
+  | "compare";
+
+/**
+ * The landing View. Sessions is the retained evidence a reader opens Studio for,
+ * so an unknown route and a fresh launch both resolve here rather than to
+ * whichever View happens to sort first in the sidebar.
+ */
+export const STUDIO_DEFAULT_AREA: StudioArea = "sessions";
+
+export type StudioCompareSurface = "live" | "sessions" | "bench" | "results";
+export type StudioInspectorSurface = "workbench";
+
+/** One selectable local ACP Agent, as published by the server's bounded catalog. */
+export interface StudioAcpAgentOption {
+  id: string;
+  label: string;
+  available: boolean;
+  detail: string;
+  /**
+   * Whether this Agent can run inside a microVM instead of on this machine.
+   * Independent of `available`: a box installs the Agent itself, so one may be
+   * boxable without being installed here, or installed here without a recipe.
+   */
+  boxAvailable?: boolean;
+  boxDetail?: string;
+}
+
+/** Retained Session count for one Agent (Coding Agent / ACP client) in the active Project. */
+export interface StudioSessionAgent {
+  agent: string;
+  sessionCount: number;
+}
+
+/**
+ * Session compare asks what two Agents did to the same working tree, so its
+ * readiness is an Agent-count question, not a Project-count or Session-count
+ * question. Two Sessions from a single Agent stay comparable but cannot answer
+ * it, and that narrower capability is reported as such.
+ */
+export type StudioSessionCompareScope = "cross-agent" | "single-agent" | "insufficient";
+
+export interface StudioConfig {
+  sessionPerformanceEnabled?: boolean;
+  /** Whether a native structural-diff host is staged, so the commit view can offer both readings. */
+  structuralDiffEnabled?: boolean;
+  /** Whether a native architecture host is staged, so the Impact surface has something to read. */
+  architectureImpactEnabled?: boolean;
+  /** Whether a native pty host is staged, so a terminal surface can spawn a real TTY. */
+  ptyEnabled?: boolean;
+  runEnabled: boolean;
+  acpEnabled: boolean;
+  acpAgentLabel?: string;
+  acpRuntimeProfile?: "acp-v1-stdio" | "acp-v1-rust" | "acp-v1-nsxpc";
+  acpAgents?: readonly StudioAcpAgentOption[];
+  artifactsEnabled: boolean;
+  artifactCount?: number;
+  /** Whether an apps host is configured, so the Components workbench has a surface to host. */
+  appsHostEnabled?: boolean;
+  evidenceEnabled: boolean;
+  experimentEnabled: boolean;
+  experimentRunnable: boolean;
+  gitEnabled: boolean;
+  harnessMode: "none" | "configured" | "workspace-default";
+  historyEnabled: boolean;
+  inspectorEnabled: boolean;
+  workspaceWorkbenchEnabled: boolean;
+  workspaceDiscoveryEnabled: boolean;
+  workspaceConnected: boolean;
+  workspaceScanRequired?: boolean;
+  /** The observation window the loaded workspace was discovered for. */
+  workspaceWindow?: { fromMs?: number; toMs?: number };
+  /** Sessions inside that window the bounded scan could not return. */
+  workspaceOmittedCount?: number;
+  projectExecutionEnabled: boolean;
+  activeProjectId?: string;
+  projectRevision?: number;
+  sessionCount: number;
+  /** Per-Agent Session breakdown. Absent when the host predates the Agent dimension. */
+  sessionAgents?: readonly StudioSessionAgent[];
+  inputCount: number;
+  intentAnalysisEnabled: boolean;
+  customizationAnalysisEnabled: boolean;
+  customizationAnalyzed: boolean;
+  customizationDefinitionCount: number;
+}
+
+export type StudioAvailability = "ready" | "partial" | "foundation";
+
+export interface StudioDestination {
+  id: StudioArea;
+  label: string;
+  group: string;
+  availability: StudioAvailability;
+  status: string;
+}
+
+export function studioDestinations(config: StudioConfig, activeCompareSurface: StudioCompareSurface | undefined, t: TFunction<"common">): readonly StudioDestination[] {
+  const compareAvailable = config.experimentEnabled || config.evidenceEnabled;
+  const compareScope = sessionCompareScope(config);
+  const debuggerReady = isDebuggerReady(config);
+  const artifactsReady = hasUsableArtifacts(config);
+  const availableCompareSurfaces = compareSurfaces(config);
+  const effectiveCompareSurface = activeCompareSurface !== undefined && availableCompareSurfaces.includes(activeCompareSurface)
+    ? activeCompareSurface
+    : availableCompareSurfaces[0];
+  const sessionsStatus = (): string => config.workspaceConnected
+    ? t("destination.sessions", { count: config.sessionCount })
+    : t("destination.workspaceRequired");
+  const artifactsStatus = (): string => artifactsReady
+    ? config.artifactCount === undefined
+      ? t("destination.compatibilityCatalog")
+      : t("destination.artifacts", { count: config.artifactCount })
+    : t("destination.noObservedOutputs");
+  const debuggerStatus = (): string => debuggerReady
+    ? config.harnessMode === "workspace-default" ? t("destination.localDefault") : t("destination.liveRuns")
+    : config.harnessMode === "workspace-default"
+      ? config.workspaceConnected ? t("destination.readOnlyProject") : t("destination.workspaceRequired")
+      : t("destination.harnessRequired");
+  const compareStatus = (): string => effectiveCompareSurface === undefined
+    ? config.workspaceConnected
+      ? compareScope === "single-agent" ? t("destination.singleAgentOnly") : t("destination.secondAgentRequired")
+      : t("destination.workspaceRequired")
+    : effectiveCompareSurface === "live"
+      ? t("destination.liveAgentCompare")
+      : effectiveCompareSurface === "bench"
+        ? config.experimentRunnable ? t("destination.harnessBench") : t("destination.comparisonBlocked")
+        : effectiveCompareSurface === "results"
+          ? t("destination.frozenResults")
+          : compareScope === "cross-agent"
+            ? t("destination.agentCompare")
+            : compareScope === "insufficient"
+              ? t("destination.secondAgentRequired")
+              : t("destination.singleAgentOnly");
+  const impactStatus = (): string => config.gitEnabled
+    ? config.architectureImpactEnabled ? t("destination.architectureModel") : t("destination.architectureHostUnavailable")
+    : config.workspaceConnected ? t("destination.notGitRepository") : t("destination.workspaceRequired");
+
+  // Rows are ordered by the sidebar section they belong to. Daily reading —
+  // Sessions and its sub-routes, then the Customizations catalog — comes first;
+  // the professional workbenches (Memory, Compare, Debugger, Artifacts,
+  // Components) follow.
+  // The sidebar groups consecutive rows that share a `group` label under one
+  // header, so this order is what draws the Daily and Professional sections.
+  return [
+    {
+      id: "sessions",
+      label: t("area.sessions"),
+      group: t("group.daily"),
+      availability: config.workspaceConnected ? "ready" : "partial",
+      status: sessionsStatus(),
+    },
+    {
+      id: "session-performance", label: t("area.session-performance"), group: t("group.daily"),
+      availability: config.sessionPerformanceEnabled ? "ready" : "foundation", status: config.sessionPerformanceEnabled ? t("area.session-performance") : t("destination.collectorUnavailable"),
+    },
+    {
+      id: "commits",
+      label: t("area.commits"),
+      group: t("group.daily"),
+      availability: config.gitEnabled ? "ready" : config.workspaceConnected ? "partial" : "foundation",
+      status: config.gitEnabled ? t("destination.repositoryHistory") : config.workspaceConnected ? t("destination.notGitRepository") : t("destination.workspaceRequired"),
+    },
+    {
+      // A surface of its own rather than a pane inside Commits: the projection
+      // needs the whole pane it is drawn in, and reading history is a different
+      // question from asking what one commit moved.
+      id: "impact",
+      label: t("area.impact"),
+      group: t("group.daily"),
+      availability: config.gitEnabled
+        ? config.architectureImpactEnabled ? "ready" : "partial"
+        : config.workspaceConnected ? "partial" : "foundation",
+      status: impactStatus(),
+    },
+    {
+      id: "customizations",
+      label: t("area.customizations"),
+      group: t("group.daily"),
+      availability: config.customizationAnalysisEnabled ? "ready" : "foundation",
+      status: config.customizationAnalyzed
+        ? t("destination.definitions", { count: config.customizationDefinitionCount })
+        : config.customizationAnalysisEnabled
+          ? t("destination.analyzeHosts")
+          : t("destination.collectorUnavailable"),
+    },
+    { id: "memory", label: t("area.memory"), group: t("group.professional"), availability: "ready", status: t("memoryReview.preview") },
+    {
+      id: "compare",
+      label: t("area.compare"),
+      group: t("group.professional"),
+      availability: effectiveCompareSurface === "bench" && !config.experimentRunnable
+        ? "partial"
+        : effectiveCompareSurface === "sessions" && compareScope !== "cross-agent"
+          ? "partial"
+          : effectiveCompareSurface === "live" || compareAvailable || compareScope === "cross-agent"
+            ? "ready"
+            : config.workspaceConnected ? "partial" : "foundation",
+      status: compareStatus(),
+    },
+    {
+      id: "debugger",
+      label: t("area.debugger"),
+      group: t("group.professional"),
+      availability: debuggerReady ? "ready" : "foundation",
+      status: debuggerStatus(),
+    },
+    {
+      id: "artifacts",
+      label: t("area.artifacts"),
+      group: t("group.professional"),
+      availability: "ready",
+      status: artifactsStatus(),
+    },
+    {
+      id: "components",
+      label: t("area.components"),
+      group: t("group.professional"),
+      availability: config.appsHostEnabled ? "ready" : "foundation",
+      status: config.appsHostEnabled ? t("destination.componentsHostConnected") : t("destination.componentsHostRequired"),
+    },
+    {
+      // The native pseudo-terminal surface. Foundation until a pty host is
+      // staged, the same way Impact and Components report a missing native host.
+      id: "terminal",
+      label: t("area.terminal"),
+      group: t("group.professional"),
+      availability: config.ptyEnabled ? "ready" : "foundation",
+      status: config.ptyEnabled ? t("destination.terminalReady") : t("destination.terminalRequired"),
+    },
+  ];
+}
+
+export function compareSurfaces(config: StudioConfig): readonly StudioCompareSurface[] {
+  return [
+    ...(liveCompareReady(config) ? ["live" as const] : []),
+    // A connected Project always keeps the Sessions surface reachable. Zero or
+    // one retained Session still has a place to land; hiding the tab after a
+    // View switch made it look like Sessions itself disappeared.
+    ...(config.workspaceConnected ? ["sessions" as const] : []),
+    ...(config.experimentEnabled ? ["bench" as const] : []),
+    ...(config.evidenceEnabled ? ["results" as const] : []),
+  ];
+}
+
+/** Agents this host can actually launch for a live comparison. */
+export function selectableAcpAgents(config: StudioConfig): readonly StudioAcpAgentOption[] {
+  return (config.acpAgents ?? []).filter((agent) => agent.available);
+}
+
+/**
+ * A live comparison starts two Agent runs against the open Project, so it needs
+ * a launchable ACP Agent and a Project that can execute. It stays reachable with
+ * a single available Agent, because the reader may still want the same Agent on
+ * both sides.
+ */
+export function liveCompareReady(config: StudioConfig): boolean {
+  return config.acpEnabled
+    && config.projectExecutionEnabled
+    && selectableAcpAgents(config).length >= 1;
+}
+
+/** Agents that contributed at least one retained Session to the active Project. */
+export function sessionAgents(config: StudioConfig): readonly StudioSessionAgent[] {
+  return (config.sessionAgents ?? []).filter((entry) => entry.sessionCount > 0);
+}
+
+export function sessionCompareScope(config: StudioConfig): StudioSessionCompareScope {
+  if (config.sessionCount < 2) return "insufficient";
+  return sessionAgents(config).length >= 2 ? "cross-agent" : "single-agent";
+}
+
+export function inspectorSurfaces(config: StudioConfig): readonly StudioInspectorSurface[] {
+  return config.inspectorEnabled ? ["workbench"] : [];
+}
+
+function isDebuggerReady(config: StudioConfig): boolean {
+  return (config.runEnabled || config.acpEnabled)
+    && (config.harnessMode !== "workspace-default" || config.projectExecutionEnabled);
+}
+
+function hasUsableArtifacts(config: StudioConfig): boolean {
+  return config.artifactsEnabled && (config.artifactCount === undefined || config.artifactCount > 0);
+}
+
+export function studioProjectGateRequired(config: StudioConfig, hasConfiguredSources: boolean, area: StudioArea = STUDIO_DEFAULT_AREA): boolean {
+  if (area === "artifacts" || area === "components" || area === "terminal" || area === "memory-sources" || area === "memory") return false;
+  const independentContext = hasConfiguredSources
+    || config.inspectorEnabled
+    || config.evidenceEnabled
+    || config.experimentEnabled
+    || hasUsableArtifacts(config)
+    || config.harnessMode === "configured";
+  return config.workspaceDiscoveryEnabled
+    && !config.workspaceConnected
+    && !independentContext;
+}
+
+export function capabilitySummary(config: StudioConfig, t: TFunction<"common">): { ready: number; partial: number; foundation: number } {
+  return studioDestinations(config, undefined, t).reduce(
+    (summary, destination) => ({ ...summary, [destination.availability]: summary[destination.availability] + 1 }),
+    { ready: 0, partial: 0, foundation: 0 },
+  );
+}

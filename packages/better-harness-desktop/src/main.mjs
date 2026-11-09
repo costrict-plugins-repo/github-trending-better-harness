@@ -1,0 +1,262 @@
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, session, sharedTexture, utilityProcess } from 'electron';
+import { randomBytes } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+import { connectStudioService, desktopEsbuildOptions } from './service-host.mjs';
+import { startAppsHost } from './apps-host.mjs';
+import { createNativeChartController } from './native-chart-host.mjs';
+import { HEADER, isSameOrigin, isExternalUrl } from './protocol.mjs';
+
+let window;
+let service;
+let appsHost;
+let nativeCharts;
+let origin;
+let quitting = false;
+let failureReported = false;
+const token = randomBytes(32).toString('hex');
+
+function fail(error) {
+  if (failureReported || quitting) return;
+  failureReported = true;
+  console.error(error);
+  dialog.showErrorBox('Harness Studio could not continue', error.message);
+  app.quit();
+}
+
+/**
+ * The window is frameless so Studio's own unified toolbar reaches the top of the
+ * window, with the OS window controls inlaid into it.
+ *
+ * macOS keeps its traffic lights and only drops the title bar strip
+ * (`hiddenInset`), positioned to centre in Studio's 52px toolbar. Windows and
+ * Linux have no equivalent, so they take `titleBarOverlay`, which paints native
+ * minimise/maximise/close over the trailing edge instead. The two sides differ,
+ * so the renderer is told which edge to reserve rather than guessing from the
+ * user agent.
+ */
+/**
+ * Locate the staged microVM shim, when this build has one.
+ *
+ * `scripts/rust.mjs` skips `box-service` where BoxLite cannot be compiled, so a
+ * missing binary is an ordinary outcome. Returning nothing keeps the start
+ * contract honest: Studio only offers a microVM placement it can actually run.
+ */
+function boxExecOptions() {
+  if (process.platform === 'win32') return {};
+  const executable = join(
+    app.isPackaged ? process.resourcesPath : fileURLToPath(new URL('../dist', import.meta.url)),
+    'native',
+    'harness-box-exec',
+  );
+  return existsSync(executable) ? { boxExecExecutable: executable } : {};
+}
+
+function windowChrome() {
+  if (process.platform === 'darwin') {
+    return { titleBarStyle: 'hiddenInset', trafficLightPosition: { x: 16, y: 19 } };
+  }
+  return { titleBarStyle: 'hidden', titleBarOverlay: titleBarOverlay() };
+}
+
+/**
+ * The application icon for an unpackaged run.
+ *
+ * A packaged build carries its own: electron-builder seals `build/icon.icns`
+ * into the .app and `build/icon.ico` into the .exe, and `build/` is not shipped
+ * inside the app, so there is nothing to point at there. Running from source has
+ * neither, and would otherwise show Electron's default mark in the Dock and
+ * taskbar, which reads as a different application than the packaged Studio.
+ */
+function developmentIcon() {
+  if (app.isPackaged) return undefined;
+  const icon = fileURLToPath(new URL('../build/icon.png', import.meta.url));
+  return existsSync(icon) ? icon : undefined;
+}
+
+/** Mirrors the `titlebar` surface token so the overlay is not a foreign block. */
+function titleBarOverlay() {
+  const dark = nativeTheme.shouldUseDarkColors;
+  return {
+    color: dark ? '#313137' : '#f0f0f4',
+    symbolColor: dark ? '#bebec9' : '#54545c',
+    height: 52,
+  };
+}
+
+async function createWindow() {
+  const icon = developmentIcon();
+  window = new BrowserWindow({
+    width: 1440, height: 900, minWidth: 390, minHeight: 600,
+    title: 'Harness Studio', show: false,
+    // macOS ignores this and takes the Dock icon from the bundle or app.dock.
+    ...(icon ? { icon } : {}),
+    ...windowChrome(),
+    webPreferences: {
+      partition: 'better-harness-desktop', nodeIntegration: false, contextIsolation: true,
+      sandbox: true, webviewTag: false,
+      preload: fileURLToPath(new URL('./native-chart-preload.cjs', import.meta.url)),
+    },
+  });
+  window.webContents.on('will-attach-webview', (event) => event.preventDefault());
+  window.webContents.on('will-navigate', (event, url) => {
+    if (!isSameOrigin(url, origin)) event.preventDefault();
+  });
+  window.webContents.on('will-redirect', (event, url) => {
+    if (!isSameOrigin(url, origin)) event.preventDefault();
+  });
+  window.webContents.setWindowOpenHandler(({ url }) => {
+    // External links require an explicit native confirmation; no protocol handlers.
+    if (isExternalUrl(url) && !isSameOrigin(url, origin)) {
+      void dialog.showMessageBox(window, {
+        type: 'question', message: 'Open this link in your browser?', detail: url,
+        buttons: ['Cancel', 'Open'], defaultId: 0, cancelId: 0,
+      }).then(async ({ response }) => {
+        if (response === 1) {
+          const { shell } = await import('electron');
+          await shell.openExternal(url);
+        }
+      }).catch(console.error);
+    }
+    return { action: 'deny' };
+  });
+  window.once('ready-to-show', () => window?.show());
+  window.on('closed', () => { window = undefined; });
+  // preload 只提供版本化图表桥接；shell 外观仍由无凭据的 URL 参数传入。
+  // 认证 token 只由 session 注入请求头，不进入 preload 或页面。
+  nativeCharts.attach(window, origin);
+  await window.loadURL(studioUrl(origin));
+}
+
+/** Tells the app it is inside the desktop shell, and which edge the OS controls take. */
+function studioUrl(base) {
+  const url = new URL(base);
+  url.searchParams.set('shell', 'desktop');
+  url.searchParams.set('controls', process.platform === 'darwin' ? 'left' : 'right');
+  return url.toString();
+}
+
+if (!app.requestSingleInstanceLock()) app.quit();
+else {
+  app.on('second-instance', () => {
+    if (window?.isMinimized()) window.restore();
+    window?.focus();
+  });
+  app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
+  // Windows and Linux paint the window controls themselves, so the overlay has to
+  // be repainted when the host appearance changes. macOS renders its own traffic
+  // lights and needs nothing here.
+  if (process.platform !== 'darwin') {
+    nativeTheme.on('updated', () => {
+      if (window && !window.isDestroyed()) window.setTitleBarOverlay(titleBarOverlay());
+    });
+  }
+  app.on('activate', () => { if (!window && origin && !quitting) void createWindow().catch(fail); });
+  app.on('before-quit', (event) => {
+    if (quitting || (!service && !appsHost && !nativeCharts)) return;
+    event.preventDefault();
+    quitting = true;
+    // 先销毁消费端以释放 Canvas 引用，再等待有界排空，不能提前 terminate GPU worker。
+    window?.destroy();
+    void Promise.allSettled([nativeCharts?.stop(), service?.stop(), appsHost?.stop()]).finally(() => app.quit());
+  });
+  void app.whenReady().then(async () => {
+    const addonPath = app.isPackaged
+      ? process.platform === 'darwin'
+        ? join(process.resourcesPath, '..', 'Frameworks', 'harness-chart-runtime.node')
+        : join(process.resourcesPath, 'native', 'harness-chart-runtime.node')
+      : fileURLToPath(new URL('../dist/native/harness-chart-runtime.node', import.meta.url));
+    nativeCharts = createNativeChartController({ ipcMain, sharedTexture, addonPath });
+    // 仅 main 的诊断接口供桌面端验收使用，不暴露到 renderer。
+    globalThis.harnessNativeChartDiagnostics = () => nativeCharts.diagnostics();
+    const icon = developmentIcon();
+    if (icon && process.platform === 'darwin') app.dock?.setIcon(icon);
+    const desktopSession = session.fromPartition('better-harness-desktop');
+    desktopSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
+    desktopSession.setPermissionCheckHandler(() => false);
+    // The component host runs as its own process beside Studio: it owns app
+    // backends, their lifecycle and their state, and one left running from an
+    // earlier session is reused instead of duplicated. A missing host is an
+    // ordinary outcome — Studio then explains the surface instead of hosting it.
+    const appsHostStart = startAppsHost({ dataDirectory: app.getPath('userData') }).catch(() => undefined);
+    const child = utilityProcess.fork(fileURLToPath(new URL('./studio-service.mjs', import.meta.url)), [], {
+      serviceName: 'Harness Studio Service', stdio: 'pipe',
+    });
+    child.stdout?.on('data', (data) => process.stdout.write(data));
+    child.stderr?.on('data', (data) => process.stderr.write(data));
+    appsHost = await appsHostStart;
+    service = connectStudioService(child, {
+      token, dataDirectory: app.getPath('userData'), onFailure: fail,
+      ...(appsHost === undefined ? {} : { appsHostUrl: appsHost.url }),
+      ...desktopEsbuildOptions({ platform: process.platform, contentsDirectory: app.isPackaged
+        ? join(process.resourcesPath, '..')
+        : fileURLToPath(new URL('../dist/native/Harness Esbuild.app/Contents', import.meta.url)) }),
+      oxcTransport: process.platform === 'darwin' ? 'nsxpc' : 'stdio',
+      oxcExecutable: process.platform === 'darwin'
+        ? join(app.isPackaged ? join(process.resourcesPath, '..') : fileURLToPath(new URL('../dist/native/Harness OXC.app/Contents', import.meta.url)), 'MacOS', 'harness-oxc-client')
+        : join(app.isPackaged ? process.resourcesPath : fileURLToPath(new URL('../dist', import.meta.url)), 'native', process.platform === 'win32' ? 'harness-oxc-service.exe' : 'harness-oxc-service'),
+      // macOS runs ACP through the launchd-managed NSXPC service, spawning the
+      // `harness-acp-client` bridge exactly where OXC spawns `harness-oxc-client`.
+      // Windows/Linux keep the plain `harness-acp-host` stdio driver.
+      acpHostTransport: process.platform === 'darwin' ? 'nsxpc' : 'stdio',
+      acpHostExecutable: process.platform === 'darwin'
+        ? join(app.isPackaged ? join(process.resourcesPath, '..') : fileURLToPath(new URL('../dist/native/Harness ACP.app/Contents', import.meta.url)), 'MacOS', 'harness-acp-client')
+        : join(app.isPackaged ? process.resourcesPath : fileURLToPath(new URL('../dist', import.meta.url)), 'native', process.platform === 'win32' ? 'harness-acp-host.exe' : 'harness-acp-host'),
+      evidenceHostTransport: process.platform === 'darwin' ? 'nsxpc' : 'stdio',
+      evidenceHostExecutable: process.platform === 'darwin'
+        ? join(app.isPackaged ? join(process.resourcesPath, '..') : fileURLToPath(new URL('../dist/native/Harness Evidence.app/Contents', import.meta.url)), 'MacOS', 'harness-evidence-client')
+        : join(app.isPackaged ? process.resourcesPath : fileURLToPath(new URL('../dist', import.meta.url)), 'native', process.platform === 'win32' ? 'harness-evidence-host.exe' : 'harness-evidence-host'),
+      // The structural-diff engine is the heaviest native call, so macOS reaches
+      // it through its own launchd-managed service and Windows/Linux spawn the
+      // stdio driver directly, the same split ACP and Evidence already use.
+      diffHostTransport: process.platform === 'darwin' ? 'nsxpc' : 'stdio',
+      diffHostExecutable: process.platform === 'darwin'
+        ? join(app.isPackaged ? join(process.resourcesPath, '..') : fileURLToPath(new URL('../dist/native/Harness Diff.app/Contents', import.meta.url)), 'MacOS', 'harness-diff-client')
+        : join(app.isPackaged ? process.resourcesPath : fileURLToPath(new URL('../dist', import.meta.url)), 'native', process.platform === 'win32' ? 'harness-diff-host.exe' : 'harness-diff-host'),
+      // The architecture-impact engine parses every changed file and resolves
+      // its import graph, so macOS reaches it through its own launchd-managed
+      // service and Windows/Linux spawn the stdio driver directly, the same
+      // split ACP, Evidence and Diff already use.
+      archHostTransport: process.platform === 'darwin' ? 'nsxpc' : 'stdio',
+      archHostExecutable: process.platform === 'darwin'
+        ? join(app.isPackaged ? join(process.resourcesPath, '..') : fileURLToPath(new URL('../dist/native/Harness Arch.app/Contents', import.meta.url)), 'MacOS', 'harness-arch-client')
+        : join(app.isPackaged ? process.resourcesPath : fileURLToPath(new URL('../dist', import.meta.url)), 'native', process.platform === 'win32' ? 'harness-arch-host.exe' : 'harness-arch-host'),
+      // The pty terminal driver reaches its child through a real controlling
+      // terminal. macOS routes it through its own launchd NSXPC service like the
+      // others; Windows has no ConPTY backend yet, so it is offered on POSIX
+      // only and left undefined on Windows.
+      ptyHostTransport: process.platform === 'darwin' ? 'nsxpc' : 'stdio',
+      ptyHostExecutable: process.platform === 'darwin'
+        ? join(app.isPackaged ? join(process.resourcesPath, '..') : fileURLToPath(new URL('../dist/native/Harness Pty.app/Contents', import.meta.url)), 'MacOS', 'harness-pty-client')
+        : process.platform === 'win32'
+          ? undefined
+          : join(app.isPackaged ? process.resourcesPath : fileURLToPath(new URL('../dist', import.meta.url)), 'native', 'harness-pty-host'),
+      // The microVM shim is built only where BoxLite can be compiled, so its
+      // absence is normal rather than an error: Studio then hides the placement
+      // instead of offering a run it cannot start.
+      ...boxExecOptions(),
+      async pickDirectory() {
+        if (!window || window.isDestroyed()) throw new Error('No active Studio window');
+        const result = await dialog.showOpenDialog(window, { title: 'Open a Project in Harness Studio', properties: ['openDirectory'] });
+        return result.canceled ? undefined : result.filePaths[0];
+      },
+    });
+    const ready = await service.started;
+    origin = ready.url;
+    desktopSession.webRequest.onBeforeSendHeaders((details, callback) => {
+      // Credentials never enter page JavaScript, URLs, storage or external requests.
+      for (const key of Object.keys(details.requestHeaders)) {
+        if (key.toLowerCase() === HEADER) delete details.requestHeaders[key];
+      }
+      if (isSameOrigin(details.url, origin)) details.requestHeaders[HEADER] = token;
+      callback({ requestHeaders: details.requestHeaders });
+    });
+    Menu.setApplicationMenu(Menu.buildFromTemplate([
+      ...(process.platform === 'darwin' ? [{ role: 'appMenu' }] : []),
+      { label: 'File', submenu: [{ role: 'close' }, { role: 'quit' }] },
+      { role: 'editMenu' }, { role: 'viewMenu' }, { role: 'windowMenu' },
+    ]));
+    await createWindow();
+  }).catch(fail);
+}

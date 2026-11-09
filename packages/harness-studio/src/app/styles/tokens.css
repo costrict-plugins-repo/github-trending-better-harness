@@ -1,0 +1,507 @@
+/* Studio design tokens. DESIGN.md owns the rationale; this file is its only
+   runtime source, and test/design-tokens.test.ts holds it to the measured
+   contract.
+
+   Two axes, deliberately separate:
+
+   - The content ramp — canvas, sidebar, workspace, panel, surface — is an
+     ordered elevation ramp read back to front. Its steps must be perceptible,
+     because the layout separates several regions with a ramp step and no rule.
+     The previous palette spanned 1.19:1 across the whole ramp, which is why
+     every pane read as one unfinished slab.
+   - Chrome materials — titlebar, statusbar, surface-subtle — are not ramp
+     steps. A macOS toolbar is lighter than the content it sits above, so
+     forcing it onto a monotonic ramp misdescribes it. Each is measured against
+     the content it borders instead. */
+:root {
+  color-scheme: dark;
+
+  /* Interaction. Blue is the only interaction hue: primary actions, selection
+     fills, links, and focus. It must also read as text on every neutral bed,
+     so it is a step brighter than the macOS system blue. */
+  --color-primary: #63a8ff;
+  --color-primary-hover: #82baff;
+  --color-primary-soft: #1b3054;
+  --color-on-primary: #0a1524;
+  --color-focus: #77b4ff;
+
+  /* Text. Muted is supporting content and subtle is chrome. Both are measured
+     against the busiest surface they land on — a hovered or pressed row — not
+     against the canvas. */
+  --color-text: #f2f2f5;
+  --color-text-muted: #bebec9;
+  --color-text-subtle: #b2b2bd;
+
+  /* Content ramp, back to front. Graphite rather than near-black: a ramp needs
+     room to move in both directions before a single step can be seen. */
+  --color-canvas: #0f0f12;
+  --color-sidebar: #1d1d21;
+  --color-workspace: #28282d;
+  --color-panel: #2e2e34;
+  --color-surface: #36363d;
+
+  /* Chrome materials. */
+  --color-titlebar: #313137;
+  --color-statusbar: #1d1d21;
+  --color-surface-subtle: #191a1d;
+
+  /* Row states. `selected` is the unfocused list selection; a focused source
+     list fills its active row with `primary` and uses `on-primary` text. */
+  --color-surface-hover: #3c3c44;
+  --color-surface-active: #45454d;
+  --color-surface-selected: #3a3a43;
+
+  /* Source-document colors are evidence, not Studio theme surfaces. They stay
+     fixed so a white Office slide does not invert with the workbench theme. */
+  --color-document-paper: #ffffff;
+  --color-document-ink: #000000;
+
+  /* Hairlines are alpha so one divider token works on every ramp step. */
+  --color-border: rgba(233, 240, 255, 0.11);
+  --color-border-strong: rgba(233, 240, 255, 0.2);
+
+  /* Evidence state. Always paired with text or an icon. */
+  --color-success: #4fdca4;
+  --color-success-surface: #10352a;
+  --color-warning: #f7c46a;
+  --color-warning-surface: #3b2a14;
+  --color-danger: #ff929a;
+  --color-danger-surface: #421c26;
+
+  /* The Candidate comparison lane, not a second action color. */
+  --color-candidate: #c9adff;
+  --color-candidate-surface: #2b2246;
+
+  /* Fixed ordered scale for dimensions that carry no judgement. */
+  --color-categorical-1: #7cbcec;
+  --color-categorical-2: #b298f7;
+  --color-categorical-3: #a0b1c6;
+  --color-categorical-4: #6ed7c4;
+  --color-categorical-5: #ecb36c;
+  --color-categorical-6: #a8cd78;
+  --color-categorical-7: #c9b0c0;
+
+  /* Event kind is categorical identity, not runtime judgement. The visible
+     label and timeline legend remain the authoritative meaning. */
+  --event-prompt: var(--color-categorical-1);
+  --event-plan: var(--color-categorical-2);
+  --event-explore: var(--color-categorical-3);
+  --event-change: var(--color-categorical-4);
+  --event-verify: var(--color-categorical-5);
+  --event-response: var(--color-categorical-6);
+  --event-tool: var(--color-categorical-7);
+
+  --color-overlay: rgba(6, 6, 9, 0.62);
+  --color-selection: rgba(99, 168, 255, 0.3);
+  --color-scrollbar: rgba(233, 240, 255, 0.2);
+  --color-scrollbar-hover: rgba(233, 240, 255, 0.34);
+
+  /* Depth belongs to transient surfaces only. Docked regions stay flat and
+     separate with the ramp and hairlines. macOS shadows are wide and soft
+     rather than tight and dark. */
+  --shadow-overlay: 0 32px 64px -16px rgba(0, 0, 0, 0.66), 0 8px 20px -8px rgba(0, 0, 0, 0.48);
+  --shadow-popover: 0 12px 32px -8px rgba(0, 0, 0, 0.56), 0 2px 8px -2px rgba(0, 0, 0, 0.4);
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --color-primary: #0a5fd0;
+  --color-primary-hover: #0850b0;
+  --color-primary-soft: #e8f1fe;
+  --color-on-primary: #ffffff;
+  --color-focus: #0a5fd0;
+
+  --color-text: #1d1d20;
+  --color-text-muted: #54545c;
+  --color-text-subtle: #5e5e66;
+
+  /* Content is white and the frame recedes behind it, as in a macOS document
+     window. `panel` and `surface` are legitimately the same white here;
+     hairlines carry those boundaries, not a ramp step. */
+  --color-canvas: #dcdce1;
+  --color-sidebar: #eeeef2;
+  --color-workspace: #ffffff;
+  --color-panel: #ffffff;
+  --color-surface: #ffffff;
+
+  --color-titlebar: #f0f0f4;
+  --color-statusbar: #eeeef2;
+  --color-surface-subtle: #efeff3;
+
+  --color-surface-hover: #e8e8ed;
+  --color-surface-active: #d9d9e0;
+  --color-surface-selected: #dfdfe6;
+
+  --color-border: rgba(15, 23, 42, 0.13);
+  --color-border-strong: rgba(15, 23, 42, 0.24);
+
+  --color-success: #0c6b44;
+  --color-success-surface: #e4f5ec;
+  --color-warning: #7a4900;
+  --color-warning-surface: #fcefda;
+  --color-danger: #b32b36;
+  --color-danger-surface: #fce9eb;
+
+  --color-candidate: #5f35b8;
+  --color-candidate-surface: #f2eefb;
+
+  --color-categorical-1: #165f92;
+  --color-categorical-2: #63449f;
+  --color-categorical-3: #445466;
+  --color-categorical-4: #106355;
+  --color-categorical-5: #7f5009;
+  --color-categorical-6: #486522;
+  --color-categorical-7: #5f5768;
+
+  --color-overlay: rgba(20, 28, 40, 0.34);
+  --color-selection: rgba(10, 95, 208, 0.2);
+  --color-scrollbar: rgba(15, 23, 42, 0.26);
+  --color-scrollbar-hover: rgba(15, 23, 42, 0.42);
+
+  --shadow-overlay: 0 32px 64px -16px rgba(15, 23, 42, 0.22), 0 8px 20px -8px rgba(15, 23, 42, 0.12);
+  --shadow-popover: 0 12px 32px -8px rgba(15, 23, 42, 0.16), 0 2px 8px -2px rgba(15, 23, 42, 0.1);
+}
+
+:root {
+  --font-ui: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-code: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+
+  /* Body sits at 13px, the size a macOS control label uses, so the workbench
+     reads as an application rather than a document. `meta` is the floor for
+     meaningful text. Headings tighten as they grow so large type reads as one
+     shape rather than spaced letters. */
+  --type-display-size: 26px;
+  --type-display-line: 32px;
+  --type-display-track: -0.021em;
+  --type-page-size: 20px;
+  --type-page-line: 26px;
+  --type-page-track: -0.016em;
+  --type-section-size: 17px;
+  --type-section-line: 23px;
+  --type-section-track: -0.011em;
+  --type-subhead-size: 15px;
+  --type-subhead-line: 20px;
+  --type-body-size: 13px;
+  --type-body-line: 18px;
+  --type-label-size: 13px;
+  --type-label-line: 16px;
+  --type-pane-size: 12px;
+  --type-pane-line: 16px;
+  --type-pane-track: 0.006em;
+  --type-meta-size: 12px;
+  --type-meta-line: 16px;
+  --type-code-size: 12px;
+  --type-code-line: 18px;
+
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --weight-bold: 700;
+
+  /* Docked panes and tables use `none`. Controls, source-list rows, and tabs
+     use `xs`/`sm`; `md`/`lg` are reserved for surfaces that actually float.
+     macOS shapes controls more generously than a 5px chamfer. */
+  --radius-none: 0;
+  --radius-xs: 6px;
+  --radius-sm: 8px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-full: 9999px;
+
+  --space-xs: 4px;
+  --space-sm: 8px;
+  --space-md: 12px;
+  --space-lg: 16px;
+  --space-xl: 24px;
+  --space-xxl: 32px;
+  --space-xxxl: 48px;
+
+  /* A macOS unified title bar is tall and owns window-wide controls; the status
+     bar is short and reports scope. Source-list rows are single-line. */
+  --control-height: 30px;
+  --toolbar-target: 28px;
+  --pane-header-height: 34px;
+  --row-height: 28px;
+  --titlebar-height: 52px;
+  /* A workbench's own toolbar is not the window's title bar: it sits inside the
+     work area and stays compact, so it does not inherit the taller unified
+     toolbar that carries the OS window controls. */
+  --workbench-bar-height: 44px;
+  --statusbar-height: 28px;
+  --sidebar-width: 236px;
+  /* Drag bounds for the sidebar sash. Below the minimum a source-list row cannot
+     hold a name; above the maximum the content column stops being primary. */
+  --sidebar-min-width: 180px;
+  --sidebar-max-width: 420px;
+  --secondary-pane-width: 312px;
+  --navigation-row-height: 30px;
+  --session-row-height: 56px;
+  --touch-target: 44px;
+  --check-size: 16px;
+  --sash-size: 1px;
+  /* Source-list rows are inset from the sidebar edge so the selection reads as
+     a rounded row rather than a full-bleed band. */
+  --sidebar-inset: var(--space-sm);
+  --motion-press: 90ms;
+  --motion-fast: 130ms;
+  --motion-enter: 180ms;
+  --motion-layout: 160ms;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html,
+body,
+#root {
+  width: 100%;
+  min-height: 100%;
+  margin: 0;
+}
+
+html,
+body { max-width: 100%; overflow-x: clip; }
+
+body {
+  color: var(--color-text);
+  background: var(--color-canvas);
+  font-family: var(--font-ui);
+  font-size: var(--type-body-size);
+  font-weight: var(--weight-regular);
+  line-height: var(--type-body-line);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  scrollbar-color: var(--color-scrollbar) transparent;
+}
+
+::selection { background: var(--color-selection); }
+
+* { scrollbar-width: thin; }
+*::-webkit-scrollbar { width: var(--space-sm); height: var(--space-sm); }
+*::-webkit-scrollbar-thumb { border: 2px solid transparent; border-radius: var(--radius-full); background: var(--color-scrollbar); background-clip: padding-box; }
+*::-webkit-scrollbar-thumb:hover { background-color: var(--color-scrollbar-hover); }
+
+button,
+input,
+select,
+textarea { font: inherit; }
+
+button,
+input,
+select,
+textarea,
+summary,
+[tabindex] { outline: none; }
+
+/* Focus is drawn outside the control so it stays visible on filled buttons and
+   on rows whose own edge is a hairline. */
+:where(button, input, select, textarea, summary, [tabindex]):focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 1px;
+  border-radius: var(--radius-xs);
+}
+
+button {
+  min-height: var(--control-height);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-xs);
+  padding: var(--space-xs) var(--space-md);
+  color: var(--color-text);
+  background: var(--color-surface);
+  cursor: pointer;
+  font-size: var(--type-label-size);
+  font-weight: var(--weight-medium);
+  line-height: var(--type-label-line);
+  transition: color var(--motion-fast) ease, border-color var(--motion-fast) ease, background-color var(--motion-fast) ease, opacity var(--motion-press) ease;
+}
+
+button:hover { border-color: var(--color-border-strong); background: var(--color-surface-hover); }
+button:active:not(:disabled) { background: var(--color-surface-active); }
+button:disabled { color: var(--color-text-subtle); cursor: not-allowed; opacity: 0.48; }
+
+button.primary,
+.compare-actions > button:not(.secondary),
+.builder-footer > button,
+.new-run {
+  border-color: transparent;
+  color: var(--color-on-primary);
+  background: var(--color-primary);
+  font-weight: var(--weight-semibold);
+}
+
+button.primary:hover,
+.compare-actions > button:not(.secondary):hover,
+.builder-footer > button:hover,
+.new-run:hover { border-color: transparent; background: var(--color-primary-hover); }
+.primary:active:not(:disabled),
+.compare-actions > button:not(.secondary):active:not(:disabled),
+.builder-footer > button:active:not(:disabled),
+.new-run:active:not(:disabled) { border-color: transparent; color: var(--color-on-primary); background: var(--color-primary-hover); }
+
+h1,
+h2,
+h3,
+h4,
+p { margin-block-start: 0; }
+
+h1 { font-size: var(--type-page-size); line-height: var(--type-page-line); letter-spacing: var(--type-page-track); }
+h2 { font-size: var(--type-section-size); line-height: var(--type-section-line); letter-spacing: var(--type-section-track); }
+h3 { font-size: var(--type-label-size); line-height: var(--type-label-line); }
+
+small,
+time,
+dt,
+dd,
+em {
+  font-size: var(--type-meta-size);
+  line-height: var(--type-meta-line);
+}
+
+code,
+pre,
+kbd,
+samp {
+  font-family: var(--font-code);
+  font-size: var(--type-code-size);
+  line-height: var(--type-code-line);
+}
+
+code { overflow-wrap: anywhere; }
+
+.muted,
+.inspector-note,
+.trace-empty,
+.activity-empty { color: var(--color-text-muted); }
+.warning,
+.status-warning { color: var(--color-warning); }
+.error,
+.status-danger { color: var(--color-danger); }
+.status-success { color: var(--color-success); }
+
+.status-accept,
+.verdict-accept { color: var(--color-success); }
+.status-reject,
+.status-infrastructure_error,
+.verdict-reject,
+.verdict-infrastructure_error { color: var(--color-danger); }
+.status-descriptive,
+.status-need_more_work,
+.status-insufficient_evidence,
+.verdict-need_more_work { color: var(--color-warning); }
+.verdict-insufficient_evidence { color: var(--color-text-muted); }
+
+.highlighted-code {
+  margin: 0;
+  overflow: auto;
+  color: var(--color-text);
+  background: var(--color-surface);
+  white-space: pre;
+  tab-size: 2;
+}
+
+.highlighted-code code,
+.highlighted-code-line { font: inherit; }
+
+.table-scroll {
+  width: 100%;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+table {
+  width: 100%;
+  min-width: max-content;
+  border-collapse: collapse;
+  color: var(--color-text);
+  font-variant-numeric: tabular-nums;
+}
+
+th,
+td {
+  height: var(--row-height);
+  border-bottom: 1px solid var(--color-border);
+  padding: var(--space-xs) var(--space-md);
+  text-align: left;
+}
+
+thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  color: var(--color-text-muted);
+  background: var(--color-surface-subtle);
+  font-size: var(--type-pane-size);
+  font-weight: var(--weight-semibold);
+  line-height: var(--type-pane-line);
+  letter-spacing: var(--type-pane-track);
+}
+
+/* Numbers are marked, not inferred from column position: a text column in the
+   second slot stays left-aligned under its own header. */
+th.numeric,
+td.numeric { text-align: right; font-variant-numeric: tabular-nums; }
+tbody tr:hover { background: var(--color-surface-hover); }
+/* A frozen header is a sticky overlay inside the scroll region, so a row brought
+   into view by keyboard focus has to clear it rather than land underneath. */
+tbody tr { scroll-margin-top: var(--row-height); }
+
+/* The shared DataTable. Columns declare their own bounds through `<colgroup>`,
+   so a fixed layout resolves the widths up front instead of letting the longest
+   cell decide, and a cell clips rather than growing its row. The table's own
+   `min-width` is the floor at which the region scrolls horizontally. */
+.data-table-scroll {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.data-table { table-layout: fixed; }
+
+.data-table th,
+.data-table td {
+  overflow: hidden;
+  vertical-align: middle;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The sort control fills its header so the whole cell is the target, and it
+   carries no button chrome: a docked table header is not a row of buttons. */
+.data-table-sort {
+  width: 100%;
+  min-height: 0;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+  border: 0;
+  border-radius: var(--radius-none);
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  letter-spacing: inherit;
+  text-align: inherit;
+}
+
+.data-table th.numeric .data-table-sort { justify-content: flex-end; }
+.data-table-sort > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.data-table-sort:hover { color: var(--color-text); background: transparent; }
+.data-table-sort svg { flex: none; opacity: 0.5; }
+.data-table th[aria-sort] { color: var(--color-text); }
+.data-table th[aria-sort] .data-table-sort svg { opacity: 1; }
+.data-table-sort:focus-visible { outline: 2px solid var(--color-focus); outline-offset: -2px; }
+.data-table-empty td { color: var(--color-text-muted); text-align: center; }
+
+@media (max-width: 760px) {
+  :root { --control-height: 44px; --toolbar-target: 44px; --row-height: 44px; --navigation-row-height: 44px; --titlebar-height: 48px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto;
+    transition-duration: 0s;
+    animation-duration: 0s;
+    animation-iteration-count: 1;
+  }
+}

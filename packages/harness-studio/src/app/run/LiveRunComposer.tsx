@@ -1,0 +1,77 @@
+import { PromptInput, PromptInputFooter, PromptInputTextarea } from "../components/ai-elements/prompt-input.js";
+import { useEffect, useRef } from "react";
+import { useTranslation } from "react-i18next";
+import { choiceRunnable, isAcpChoice, type LiveAgentChoice, type LiveRunPlacement } from "./live-agent-choices.js";
+
+/** Owns dialog layout and focus; RunView continues to own the draft and launch. */
+export function LiveRunComposer(props: {
+  projectLabel?: string;
+  agents: readonly LiveAgentChoice[];
+  selectedAgent?: LiveAgentChoice;
+  prompt: string;
+  running: boolean;
+  onAgent: (value: string) => void;
+  onPrompt: (value: string) => void;
+  onClose: () => void;
+  onRun: () => void;
+  onChooseSession?: () => void;
+  /** Where this run will execute. Decides which Agents the picker can offer. */
+  placement?: LiveRunPlacement;
+}): React.JSX.Element {
+  const { t } = useTranslation("run");
+  const placement = props.placement ?? "host";
+  const dialog = useRef<HTMLDialogElement>(null);
+  const input = useRef<HTMLTextAreaElement>(null);
+  const canRun = !props.running && props.prompt.trim().length > 0 && props.selectedAgent !== undefined;
+  useEffect(() => {
+    const element = dialog.current!;
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : undefined;
+    element.showModal();
+    input.current?.focus();
+    return () => { element.close(); if (opener?.isConnected) opener.focus(); };
+  }, []);
+  return <dialog ref={dialog} className="live-composer" aria-labelledby="live-composer-title"
+    onKeyDown={(event) => {
+      if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); props.onClose(); return; }
+      if (event.key !== "Tab") return;
+      const controls = Array.from(event.currentTarget.querySelectorAll<HTMLElement>("select, textarea, button:not(:disabled)"));
+      const first = controls[0];
+      const last = controls.at(-1);
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+    }}
+    onCancel={(event) => { event.preventDefault(); props.onClose(); }}
+    onClick={(event) => {
+      if (event.target !== event.currentTarget) return;
+      const bounds = event.currentTarget.getBoundingClientRect();
+      if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) props.onClose();
+    }}>
+      <header><h2 id="live-composer-title">{t("composer.title")}</h2>{placement === "box" && <em className="live-composer-placement">{t("placement.box")}</em>}{props.projectLabel && <span title={props.projectLabel}>{props.projectLabel}</span>}</header>
+    {/* A first boxed run pulls an image and installs the Agent with no progress
+        to show for it. Saying so up front is the honest version of a progress
+        bar Studio cannot yet draw: the shim owns that work, and its state does
+        not reach here. */}
+    {placement === "box" && <p className="live-composer-hint">{t("placement.firstRunHint")}</p>}
+    <PromptInput onSubmit={(event) => { event.preventDefault(); if (canRun) props.onRun(); }}>
+      <PromptInputTextarea ref={input} value={props.prompt} aria-label={t("composer.promptLabel")} placeholder={t("composer.promptPlaceholder")} onValueChange={props.onPrompt} rows={4} />
+      <PromptInputFooter><label className="live-composer-agent"><span>{t("composer.agent")}</span>
+        <select value={props.selectedAgent?.value ?? ""} onChange={(event) => props.onAgent(event.target.value)}>
+          {props.agents.map((choice) => {
+            // In a box, every verdict is the box's. Falling back to the host
+            // detail would tell a reader that a boxable Agent "is not
+            // installed" — true of this machine, irrelevant to the guest.
+            const runnable = choiceRunnable(choice, placement);
+            const detail = placement !== "box"
+              ? choice.detail
+              : isAcpChoice(choice)
+                ? choice.boxDetail ?? choice.detail
+                : t("placement.localNotBoxable");
+            return <option key={choice.value} value={choice.value} disabled={!runnable} title={detail}>
+              {runnable ? choice.label : t("composer.agentUnavailable", { agent: choice.label })}
+            </option>;
+          })}
+        </select>
+      </label>{props.onChooseSession && <button type="button" disabled={!canRun} onClick={props.onChooseSession}>{t("connection.title")}</button>}<button type="button" onClick={props.onClose}>{t("composer.cancel")}</button><button type="submit" className="primary" disabled={!canRun}>{t("composer.run")}</button></PromptInputFooter>
+    </PromptInput>
+  </dialog>;
+}
